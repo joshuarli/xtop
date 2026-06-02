@@ -82,20 +82,40 @@ pub fn render(
 
     // Render into buffer sized for up to 1024 cores.
     var b: [131072]u8 = undefined;
+    const out = try renderToBuf(&b, sys, mem, net, power, procs, sort_key, w, ncols, gauge_w, mem_chart_h, pwr_chart_h, net_half_h, proc_max_rows);
+    _ = try tui.writeAll(out);
+}
+
+pub fn renderToBuf(
+    buf: []u8,
+    sys: *const SystemCpu,
+    mem: *const MemState,
+    net: *const NetState,
+    power: *const PowerState,
+    procs: []const *const Process,
+    sort_key: types.SortKey,
+    w: usize,
+    ncols: usize,
+    gauge_w: usize,
+    mem_chart_h: usize,
+    pwr_chart_h: usize,
+    net_half_h: usize,
+    proc_max_rows: usize,
+) ![]const u8 {
     var o: usize = 0;
-    o += tui.wrs(b[o..], "\x1b[?2026h\x1b[H");
-    o += cpuWidget(b[o..], sys, w, ncols, gauge_w);
-    o += try memWidget(b[o..], mem, w, mem_chart_h);
-    o += try powerWidget(b[o..], power, w, pwr_chart_h);
-    o += try netWidget(b[o..], net, w, net_half_h);
-    o += try procWidget(b[o..], procs, mem.total_kb, w, proc_max_rows);
-    o += (try std.fmt.bufPrint(b[o..], "  sort: {s} | c/m: sort  q: quit\x1b[K\x1b[J\x1b[?2026l", .{if (sort_key == .cpu) "CPU" else "MEM"})).len;
-    _ = try tui.writeAll(b[0..o]);
+    o += tui.wrs(buf[o..], "\x1b[?2026h\x1b[H");
+    o += cpuWidget(buf[o..], sys, w, ncols, gauge_w);
+    o += try memWidget(buf[o..], mem, w, mem_chart_h);
+    o += try powerWidget(buf[o..], power, w, pwr_chart_h);
+    o += try netWidget(buf[o..], net, w, net_half_h);
+    o += try procWidget(buf[o..], procs, mem.total_kb, w, proc_max_rows);
+    o += (try std.fmt.bufPrint(buf[o..], "  sort: {s} | c/m: sort  q: quit\x1b[K\x1b[J\x1b[?2026l", .{if (sort_key == .cpu) "CPU" else "MEM"})).len;
+    return buf[0..o];
 }
 
 // ─── CPU widget ───
 
-fn cpuWidget(buf: []u8, sys: *const SystemCpu, w: usize, ncols: usize, gauge_w: usize) usize {
+pub fn cpuWidget(buf: []u8, sys: *const SystemCpu, w: usize, ncols: usize, gauge_w: usize) usize {
     var cb: [65536]u8 = undefined;
     var cl: usize = 0;
     const rows = (sys.num_cores + ncols - 1) / ncols;
@@ -254,7 +274,7 @@ fn renderChart(
 
 // ─── Memory widget ───
 
-fn memWidget(buf: []u8, mem: *const MemState, w: usize, chart_h: usize) !usize {
+pub fn memWidget(buf: []u8, mem: *const MemState, w: usize, chart_h: usize) !usize {
     const Series = struct { rb: *const SampleRing, color: []const u8 };
     var s: [2]Series = undefined;
     s[0] = .{ .rb = &mem.mem_history, .color = tui.M };
@@ -293,7 +313,7 @@ fn memWidget(buf: []u8, mem: *const MemState, w: usize, chart_h: usize) !usize {
 
 // ─── Power widget ───
 
-fn powerWidget(buf: []u8, power: *const PowerState, w: usize, chart_h: usize) !usize {
+pub fn powerWidget(buf: []u8, power: *const PowerState, w: usize, chart_h: usize) !usize {
     if (!power.has_perms) {
         var o: usize = 0;
         o += try tui.boxTop(buf[o..], "Power", w);
@@ -321,7 +341,7 @@ fn powerWidget(buf: []u8, power: *const PowerState, w: usize, chart_h: usize) !u
 
 // ─── Network widget ───
 
-fn netWidget(buf: []u8, net: *const NetState, w: usize, half_h: usize) !usize {
+pub fn netWidget(buf: []u8, net: *const NetState, w: usize, half_h: usize) !usize {
     const y_w: usize = 5;
     const n_cols = w -| 2 -| y_w;
     if (n_cols < 4) return 0;
@@ -488,7 +508,7 @@ fn fsize(buf: []u8, kb: u64) []const u8 {
 
 // ─── Process widget ───
 
-fn procWidget(buf: []u8, procs: []const *const Process, total_mem_kb: u64, w: usize, max_rows: usize) !usize {
+pub fn procWidget(buf: []u8, procs: []const *const Process, total_mem_kb: u64, w: usize, max_rows: usize) !usize {
     var o: usize = 0;
     o += try tui.boxTop(buf[o..], "Processes", w);
 

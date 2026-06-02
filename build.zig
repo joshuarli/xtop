@@ -25,6 +25,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
 
+    // Render/TUI integration tests — needs direct file access since
+    // render.zig and tui.zig live in the executable module, not the library.
+    const test_runner_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_runner_mod.addImport("xtop", lib_mod);
+    const render_tests = b.addTest(.{
+        .root_module = test_runner_mod,
+    });
+    const run_render_tests = b.addRunArtifact(render_tests);
+    test_step.dependOn(&run_render_tests.step);
+
     // Executable — imports the library via `@import("xtop")`
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

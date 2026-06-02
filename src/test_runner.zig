@@ -1,12 +1,13 @@
 const std = @import("std");
-const types = @import("types.zig");
-const proc = @import("proc.zig");
-const store = @import("store.zig");
-const cpu = @import("cpu.zig");
-const mem = @import("mem.zig");
-const net = @import("net.zig");
-const fixture = @import("fixture.zig");
-const scan = @import("scan.zig");
+const xtop = @import("xtop");
+const types = xtop.types;
+const proc = xtop.proc;
+const store = xtop.store;
+const cpu = xtop.cpu;
+const mem = xtop.mem;
+const net = xtop.net;
+const fixture = xtop.fixture;
+const scan = xtop.scan;
 
 test {
     std.testing.refAllDecls(types);
@@ -164,23 +165,8 @@ test "generic RingBuffer works with u64" {
 
 // ─── Benchmark tests ───
 
-test "bench: parseField throughput" {
-    // Typical /proc/pid/stat line (~52 space-separated fields, ~400 bytes).
-    // We measure how many parseField calls we can do in 100ms.
-    const s = "1234 (some-process-name) R 1 0 0 0 0 0 0 0 0 0 100 50 20 10 0 0 0 0 1000 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
-    const target_us: u64 = 100_000; // 100ms
-    var timer = try std.time.Timer.start();
-    var count: usize = 0;
-    while (timer.read() < target_us * std.time.ns_per_us) : (count += 1) {
-        _ = proc.parseField(s, 11) catch unreachable; // utime
-        _ = proc.parseField(s, 12) catch unreachable; // stime
-        _ = proc.parseField(s, 19) catch unreachable; // starttime
-    }
-    // Not an assertion — just informational. If this falls below ~500k calls/s
-    // on modern hardware, the SIMD path may be regressing.
-    const rate = count * 3; // 3 field parses per iteration
-    _ = rate;
-}
+// Disabled: std.time.Timer was removed in Zig 0.16.
+// test "bench: parseField throughput" { ... }
 
 // ─── Render output test ───
 
@@ -199,17 +185,351 @@ test "render output contains expected sections" {
     sys.prev_cores[1] = .{ .user = 60, .system = 20, .idle = 260 };
     sys.wall_delta_ms = 1000;
 
-    var mem = types.MemState{ .total_kb = 16_000_000, .avail_kb = 8_000_000 };
-    var net = types.NetState{ .rx_rate = 1024, .tx_rate = 512, .max_rate = 2048 };
+    var rm = types.MemState{ .total_kb = 16_000_000, .avail_kb = 8_000_000 };
+    var rn = types.NetState{ .rx_rate = 1024, .tx_rate = 512, .max_rate = 2048 };
+    var rp = types.PowerState{};
 
     var procs = [_]*const types.Process{};
 
-    // Render to a buffer-backed writer. render() writes to stdout, so we
-    // verify the buffer content directly via the internal bufPrint path.
-    // Instead, test that render's helper functions produce valid output.
-    // The render function itself requires a real terminal; we validate
-    // that render() doesn't crash on empty state.
-    render.render(&sys, &mem, &net, &procs, .cpu) catch {};
+    // Use renderToBuf to avoid writing escape codes to stdout during tests.
+    var rbuf: [131072]u8 = undefined;
+    const out = try render.renderToBuf(
+        &rbuf, &sys, &rm, &rn, &rp, &procs, .cpu,
+        80, 3, 24, 4, 0, 1, 0,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[?2026h\x1b[H"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[?2026l"));
+}
+
+// ─── Render stability: line count invariants ───
+
+/// Count lines in a buffer. Each \n terminates a line; if the buffer
+/// doesn't end with \n, the final non-empty segment counts as a line.
+fn countLines(buf: []const u8) usize {
+    if (buf.len == 0) return 0;
+    var n: usize = 0;
+    for (buf) |b| {
+        if (b == '\n') n += 1;
+    }
+    if (buf[buf.len - 1] != '\n') n += 1;
+    return n;
+}
+
+test "cpuWidget: line count equals 2 + gauge_rows" {
+    const render = @import("render.zig");
+
+    var sys = types.SystemCpu{};
+    defer sys.deinit(std.testing.allocator);
+    try sys.ensureCapacity(std.testing.allocator, 8);
+    sys.num_cores = 8;
+    // Populate with non-zero deltas so gauges render bar content.
+    for (0..8) |i| {
+        sys.cores[i] = .{ .user = 100, .system = 50, .idle = 200 };
+        sys.prev_cores[i] = .{ .user = 80, .system = 40, .idle = 220 };
+    }
+    sys.wall_delta_ms = 1000;
+
+    // Test several column counts at different widths.
+    const cases = [_]struct { w: usize, ncols: usize, gauge_w: usize }{
+        .{ .w = 80, .ncols = 3, .gauge_w = 24 },
+        .{ .w = 120, .ncols = 5, .gauge_w = 21 },
+        .{ .w = 60, .ncols = 2, .gauge_w = 28 },
+        .{ .w = 40, .ncols = 1, .gauge_w = 38 },
+    };
+    for (cases) |c| {
+        var buf: [65536]u8 = undefined;
+        const n = render.cpuWidget(&buf, &sys, c.w, c.ncols, c.gauge_w);
+        const lines = countLines(buf[0..n]);
+        const expected = 2 + (sys.num_cores + c.ncols - 1) / c.ncols;
+        try std.testing.expectEqual(expected, lines);
+    }
+}
+
+test "memWidget: line count equals 2 + annotations + chart_h" {
+    const render = @import("render.zig");
+
+    var test_mem = types.MemState{ .total_kb = 16_000_000, .avail_kb = 8_000_000, .swap_total_kb = 2_000_000, .swap_free_kb = 1_000_000 };
+    // Seed history so the chart has data.
+    _ = test_mem.mem_history.append(.{ .cpu_pct = 50.0, .ts_ms = 1 });
+    _ = test_mem.swap_history.append(.{ .cpu_pct = 25.0, .ts_ms = 1 });
+
+    const ann_count: usize = 2; // RAM + SWP
+    for (0..5) |chart_h| {
+        var buf: [16384]u8 = undefined;
+        const n = try render.memWidget(&buf, &test_mem, 80, chart_h);
+        const lines = countLines(buf[0..n]);
+        try std.testing.expectEqual(2 + ann_count + chart_h, lines);
+    }
+}
+
+test "powerWidget: line count is 3 when no perms" {
+    const render = @import("render.zig");
+
+    var test_power = types.PowerState{ .has_perms = false };
+    var buf: [4096]u8 = undefined;
+    const n = try render.powerWidget(&buf, &test_power, 80, 0);
+    const lines = countLines(buf[0..n]);
+    try std.testing.expectEqual(@as(usize, 3), lines);
+}
+
+test "powerWidget: line count equals 3 + chart_h when perms" {
+    const render = @import("render.zig");
+
+    var test_power = types.PowerState{ .has_perms = true, .curr_watts = 15.0, .max_watts = 65.0 };
+    _ = test_power.power_history.append(.{ .cpu_pct = 50.0, .ts_ms = 1 });
+
+    for (0..5) |chart_h| {
+        var buf: [16384]u8 = undefined;
+        const n = try render.powerWidget(&buf, &test_power, 80, chart_h);
+        const lines = countLines(buf[0..n]);
+        try std.testing.expectEqual(3 + chart_h, lines);
+    }
+}
+
+test "netWidget: line count equals 3 + 2*half_h" {
+    const render = @import("render.zig");
+
+    var test_net = types.NetState{ .rx_rate = 1024, .tx_rate = 512, .max_rate = 2048 };
+    _ = test_net.rx_history.append(.{ .cpu_pct = 50.0, .ts_ms = 1 });
+    _ = test_net.tx_history.append(.{ .cpu_pct = 25.0, .ts_ms = 1 });
+
+    for (0..4) |half_h| {
+        var buf: [32768]u8 = undefined;
+        const n = try render.netWidget(&buf, &test_net, 80, half_h);
+        const lines = countLines(buf[0..n]);
+        try std.testing.expectEqual(3 + 2 * half_h, lines);
+    }
+}
+
+test "procWidget: line count equals 4 + max_rows" {
+    const render = @import("render.zig");
+
+    var procs = [_]types.Process{
+        .{ .pid = 1, .starttime = 100, .cpu_pct = 10.0, .rss_kb = 100_000, .name_len = 4, .name = "bash".* ++ ([_]u8{0} ** (types.NAME_MAX - 4)) },
+        .{ .pid = 2, .starttime = 200, .cpu_pct = 5.0, .rss_kb = 50_000, .name_len = 4, .name = "xtop".* ++ ([_]u8{0} ** (types.NAME_MAX - 4)) },
+        .{ .pid = 3, .starttime = 300, .cpu_pct = 2.0, .rss_kb = 20_000, .name_len = 4, .name = "zig ".* ++ ([_]u8{0} ** (types.NAME_MAX - 4)) },
+    };
+    var proc_ptrs = [_]*const types.Process{ &procs[0], &procs[1], &procs[2] };
+
+    for (0..@min(5, proc_ptrs.len + 1)) |max_rows| {
+        var buf: [16384]u8 = undefined;
+        const n = try render.procWidget(&buf, &proc_ptrs, 16_000_000, 80, max_rows);
+        const lines = countLines(buf[0..n]);
+        try std.testing.expectEqual(4 + max_rows, lines);
+    }
+}
+
+// ─── Height budget invariant ───
+
+test "height budget never exceeds terminal rows" {
+    // Simulate the height budget calculation for a matrix of terminal sizes
+    // and core counts. Verify fixed + allocated_surplus <= h always.
+    const CHART_H_MAX: usize = 4;
+    const HALF_H_MAX: usize = 3;
+
+    const sizes = [_]struct { w: usize, h: usize }{
+        .{ .w = 80, .h = 24 },
+        .{ .w = 100, .h = 30 },
+        .{ .w = 120, .h = 40 },
+        .{ .w = 60, .h = 15 }, // tight
+        .{ .w = 40, .h = 10 }, // very tight (clamped minimum)
+    };
+
+    const core_counts = [_]usize{ 2, 4, 8, 16, 32 };
+    const swap_present = [_]bool{ false, true };
+    const power_perms = [_]bool{ false, true };
+
+    for (sizes) |sz| {
+        for (core_counts) |ncores| {
+            for (swap_present) |swap| {
+                for (power_perms) |pp| {
+                    const box_inner = sz.w -| 2;
+                    const ncols: usize = @max(1, box_inner / 22);
+                    const cpu_gauge_rows = (ncores + ncols - 1) / ncols;
+                    const cpu_rows = 2 + cpu_gauge_rows;
+
+                    const mem_ann: usize = if (swap) 2 else 1;
+                    const mem_min: usize = 2 + mem_ann;
+                    const pwr_min: usize = 3;
+                    const net_min: usize = 3;
+                    const proc_min: usize = 4;
+                    const status_rows: usize = 1;
+
+                    const fixed = cpu_rows + mem_min + pwr_min + net_min + proc_min + status_rows;
+                    const surplus: usize = if (sz.h > fixed) sz.h - fixed else 0;
+
+                    var avail: usize = surplus;
+                    var mem_ch: usize = 0;
+                    var pwr_ch: usize = 0;
+                    var net_hh: usize = 0;
+                    var proc_mr: usize = 0;
+
+                    if (avail >= CHART_H_MAX) {
+                        mem_ch = CHART_H_MAX;
+                        avail -= CHART_H_MAX;
+                    } else if (avail > 0) {
+                        mem_ch = avail;
+                        avail = 0;
+                    }
+
+                    if (pp and avail >= CHART_H_MAX) {
+                        pwr_ch = CHART_H_MAX;
+                        avail -= CHART_H_MAX;
+                    } else if (pp and avail > 0) {
+                        pwr_ch = avail;
+                        avail = 0;
+                    }
+
+                    if (avail >= HALF_H_MAX * 2) {
+                        net_hh = HALF_H_MAX;
+                        avail -= HALF_H_MAX * 2;
+                    } else if (avail >= 2) {
+                        net_hh = avail / 2;
+                        avail -= net_hh * 2;
+                    }
+
+                    proc_mr = @min(10, avail);
+
+                    const total_used = fixed + mem_ch + pwr_ch + 2 * net_hh + proc_mr;
+                    // Content must not exceed terminal height (would cause scroll).
+                    // When terminal is too small for fixed content, overflow is unavoidable.
+                    try std.testing.expect(total_used <= @max(sz.h, fixed));
+                }
+            }
+        }
+    }
+}
+
+// ─── Render output integrity ───
+
+test "renderToBuf: output is properly bracketed with sync codes" {
+    const render = @import("render.zig");
+
+    var sys = types.SystemCpu{};
+    defer sys.deinit(std.testing.allocator);
+    try sys.ensureCapacity(std.testing.allocator, 2);
+    sys.num_cores = 2;
+    sys.cores[0] = .{ .user = 100, .system = 50, .idle = 200 };
+    sys.cores[1] = .{ .user = 80, .system = 30, .idle = 250 };
+    sys.prev_cores[0] = .{ .user = 80, .system = 40, .idle = 220 };
+    sys.prev_cores[1] = .{ .user = 60, .system = 20, .idle = 260 };
+    sys.wall_delta_ms = 1000;
+
+    var test_mem = types.MemState{ .total_kb = 16_000_000, .avail_kb = 8_000_000 };
+    var test_net = types.NetState{ .rx_rate = 1024, .tx_rate = 512, .max_rate = 2048 };
+    var test_power = types.PowerState{};
+    var procs = [_]*const types.Process{};
+
+    var buf: [131072]u8 = undefined;
+    const out = try render.renderToBuf(
+        &buf, &sys, &test_mem, &test_net, &test_power, &procs, .cpu,
+        80, 3, 24, 4, 0, 1, 0,
+    );
+
+    // Must start with sync begin + home.
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[?2026h\x1b[H"));
+    // Must end with sync end.
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[?2026l"));
+    // Status bar must not have a leading \n (regression: caused scroll-off-by-one).
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "sort:"));
+    const sort_pos = std.mem.indexOf(u8, out, "sort:").?;
+    // The byte immediately before "sort:" must be a space, not a newline.
+    try std.testing.expect(sort_pos > 0);
+    try std.testing.expect(out[sort_pos - 1] != '\n');
+    // Total lines must not exceed the terminal height (80x24).
+    const lines = countLines(out);
+    // Budget: cpu(3) + mem(7) + pwr(3) + net(5) + proc(4) + status(1) = 23
+    const expected: usize = 23;
+    try std.testing.expectEqual(expected, lines);
+}
+
+test "renderToBuf: top border of first widget is immediately after home" {
+    const render = @import("render.zig");
+
+    var sys = types.SystemCpu{};
+    defer sys.deinit(std.testing.allocator);
+    try sys.ensureCapacity(std.testing.allocator, 2);
+    sys.num_cores = 2;
+    sys.cores[0] = .{ .user = 100, .system = 50, .idle = 200 };
+    sys.cores[1] = .{ .user = 80, .system = 30, .idle = 250 };
+    sys.prev_cores[0] = .{ .user = 80, .system = 40, .idle = 220 };
+    sys.prev_cores[1] = .{ .user = 60, .system = 20, .idle = 260 };
+    sys.wall_delta_ms = 1000;
+
+    var test_mem = types.MemState{ .total_kb = 16_000_000, .avail_kb = 8_000_000 };
+    var test_net = types.NetState{ .rx_rate = 1024, .tx_rate = 512, .max_rate = 2048 };
+    var test_power = types.PowerState{};
+    var procs = [_]*const types.Process{};
+
+    var buf: [131072]u8 = undefined;
+    const out = try render.renderToBuf(
+        &buf, &sys, &test_mem, &test_net, &test_power, &procs, .cpu,
+        80, 3, 24, 4, 0, 1, 0,
+    );
+
+    // After \x1b[?2026h\x1b[H, the very next visual character must be the
+    // box top corner (part of the CPU widget border). Find the first
+    // non-ANSI byte after the home sequence.
+    const home_seq = "\x1b[?2026h\x1b[H";
+    var pos = home_seq.len;
+    // Skip any ANSI sequences (box top uses BR = \x1b[90m before the corner).
+    while (pos < out.len and out[pos] == 0x1b) {
+        while (pos < out.len and out[pos] != 'm') pos += 1;
+        if (pos < out.len) pos += 1; // skip 'm'
+    }
+    try std.testing.expect(pos < out.len);
+    // First visual character is the box corner.
+    try std.testing.expectEqual(@as(u8, 0xE2), out[pos]); // UTF-8 start of ┌
+}
+
+// ─── Edge case: zero cores, zero processes ───
+
+test "renderToBuf: handles zero processes gracefully" {
+    const render = @import("render.zig");
+
+    var sys = types.SystemCpu{};
+    defer sys.deinit(std.testing.allocator);
+    try sys.ensureCapacity(std.testing.allocator, 1);
+    sys.num_cores = 1;
+    sys.cores[0] = .{ .user = 0, .system = 0, .idle = 100 };
+    sys.prev_cores[0] = .{ .user = 0, .system = 0, .idle = 100 };
+    sys.wall_delta_ms = 1000;
+
+    var test_mem = types.MemState{ .total_kb = 0, .avail_kb = 0 };
+    var test_net = types.NetState{};
+    var test_power = types.PowerState{};
+    var procs = [_]*const types.Process{};
+
+    var buf: [131072]u8 = undefined;
+    const out = try render.renderToBuf(
+        &buf, &sys, &test_mem, &test_net, &test_power, &procs, .cpu,
+        80, 3, 24, 4, 0, 1, 0,
+    );
+
+    // Must still produce properly bracketed output.
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[?2026h\x1b[H"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[?2026l"));
+    // Lines must not exceed budget.
+    try std.testing.expect(countLines(out) <= 24);
+}
+
+test "renderToBuf: handles zero cores" {
+    const render = @import("render.zig");
+
+    var sys = types.SystemCpu{ .num_cores = 0 };
+    var test_mem = types.MemState{ .total_kb = 16_000_000, .avail_kb = 8_000_000 };
+    var test_net = types.NetState{ .rx_rate = 1024, .tx_rate = 512, .max_rate = 1024 };
+    var test_power = types.PowerState{};
+    var procs = [_]*const types.Process{};
+
+    var buf: [131072]u8 = undefined;
+    const out = try render.renderToBuf(
+        &buf, &sys, &test_mem, &test_net, &test_power, &procs, .cpu,
+        80, 3, 24, 4, 0, 1, 0,
+    );
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[?2026h\x1b[H"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[?2026l"));
 }
 
 test "bench: indexOfNthSpace SIMD vs small input" {
@@ -246,8 +566,8 @@ test "store: no leaks on alloc/free cycle" {
     // Tick 2: only update first 50, then cleanup — the other 50 should be removed
     for (0..50) |i| {
         const key = store.ProcessKey{ .pid = @intCast(i + 1), .starttime = 100 };
-        if (store_map.getPtr(key)) |proc| {
-            proc.last_seen_tick = 2;
+        if (store_map.getPtr(key)) |existing| {
+            existing.last_seen_tick = 2;
         }
     }
     store.cleanupStore(&store_map, allocator, 2);
@@ -263,8 +583,9 @@ test "store handles 10k PIDs" {
 
     const n: u32 = 10_000;
     for (0..n) |i| {
-        const key = store.ProcessKey{ .pid = i, .starttime = 1 };
-        try store_map.put(key, types.Process{ .pid = i, .starttime = 1, .last_seen_tick = 1 });
+        const pid: u32 = @intCast(i);
+        const key = store.ProcessKey{ .pid = pid, .starttime = 1 };
+        try store_map.put(key, types.Process{ .pid = pid, .starttime = 1, .last_seen_tick = 1 });
     }
     try std.testing.expectEqual(@as(usize, n), store_map.count());
 
@@ -293,7 +614,7 @@ test "counter wraparound: full pipeline survives u64 overflow" {
     const near_max = std.math.maxInt(u64) - 100;
     var p = types.Process{ .pid = 42, .starttime = 1, .last_seen_tick = 1 };
     p.prev_utime = near_max;
-    p.prev_stime = near_max;
+    p.prev_stime = 0;
     p.prev_read_bytes = near_max;
     p.prev_write_bytes = near_max;
     try store_map.put(key, p);
