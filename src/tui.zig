@@ -12,6 +12,7 @@ pub const M = "\x1b[35m";
 pub const C = "\x1b[36m";
 pub const BW = "\x1b[1;37m";
 pub const BR = "\x1b[90m";
+pub const OR = "\x1b[38;5;208m";
 
 pub const CPU_COLORS = [_][]const u8{ BL, G, RD, Y, M, C, C, BR };
 

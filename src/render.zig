@@ -13,7 +13,7 @@ const TOP_N = types.TOP_N;
 
 const CHART_H_MAX: usize = 4;
 const HALF_H_MAX: usize = 3;
-const CPU_BAR: usize = 7;
+const MIN_GAUGE_W: usize = 22;
 
 pub fn render(
     sys: *const SystemCpu,
@@ -29,8 +29,8 @@ pub fn render(
 
     // Pre-compute CPU gauge rows (non-negotiable).
     const box_inner = w -| 2;
-    const gauge_w: usize = 17;
-    const ncols: usize = @max(1, box_inner / gauge_w);
+    const ncols: usize = @max(1, box_inner / MIN_GAUGE_W);
+    const gauge_w = (box_inner -| (ncols - 1) * 2) / ncols;
     const cpu_gauge_rows = (sys.num_cores + ncols - 1) / ncols;
     const cpu_rows = 2 + cpu_gauge_rows;
 
@@ -84,7 +84,7 @@ pub fn render(
     var b: [131072]u8 = undefined;
     var o: usize = 0;
     o += tui.wrs(b[o..], "\x1b[?2026h\x1b[H");
-    o += cpuWidget(b[o..], sys, w);
+    o += cpuWidget(b[o..], sys, w, ncols, gauge_w);
     o += try memWidget(b[o..], mem, w, mem_chart_h);
     o += try powerWidget(b[o..], power, w, pwr_chart_h);
     o += try netWidget(b[o..], net, w, net_half_h);
@@ -95,18 +95,15 @@ pub fn render(
 
 // ─── CPU widget ───
 
-fn cpuWidget(buf: []u8, sys: *const SystemCpu, w: usize) usize {
+fn cpuWidget(buf: []u8, sys: *const SystemCpu, w: usize, ncols: usize, gauge_w: usize) usize {
     var cb: [65536]u8 = undefined;
     var cl: usize = 0;
-    const box_inner = w -| 2;
-    const gauge_w: usize = 17;
-    const ncols: usize = @max(1, box_inner / gauge_w);
     const rows = (sys.num_cores + ncols - 1) / ncols;
     for (0..rows) |row| {
         for (0..ncols) |ci| {
             const i = ci * rows + row;
             if (i >= sys.num_cores) break;
-            cl += cpuGauge(cb[cl..], sys, i) catch cl;
+            cl += cpuGauge(cb[cl..], sys, i, gauge_w) catch cl;
             if (ci < ncols - 1 and i + rows < sys.num_cores) cl += tui.wrs(cb[cl..], "  ");
         }
         cl += tui.wrs(cb[cl..], "\n");
@@ -122,7 +119,7 @@ fn cpuWidget(buf: []u8, sys: *const SystemCpu, w: usize) usize {
     return o;
 }
 
-fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize) !usize {
+fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize, gauge_w: usize) !usize {
     const core = sys.cores[i];
     const prev = sys.prev_cores[i];
     const td = core.total() -| prev.total();
@@ -131,7 +128,8 @@ fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize) !usize {
 
     var pt: [6]u8 = undefined;
     const ptl = (try std.fmt.bufPrint(&pt, "{d: >4.1}%", .{@min(pct, 999.9)})).len;
-    const fl = CPU_BAR -| ptl;
+    const cpu_bar = gauge_w -| 5;
+    const fl = cpu_bar -| ptl;
     var o: usize = 0;
     o += (try std.fmt.bufPrint(buf[o..], "{s}{d: >3}{s}[", .{ tui.C, i, tui.R })).len;
     var bp: usize = 0;
@@ -139,7 +137,7 @@ fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize) !usize {
         const ds = [_]u64{ core.nice -| prev.nice, core.user -| prev.user, core.system -| prev.system, core.irq -| prev.irq, core.softirq -| prev.softirq, core.steal -| prev.steal, core.guest -| prev.guest, core.iowait -| prev.iowait };
         for (ds, 0..) |d, ci| {
             if (d == 0) continue;
-            const sw = @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(d)) / @as(f32, @floatFromInt(td)) * @as(f32, @floatFromInt(CPU_BAR)))));
+            const sw = @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(d)) / @as(f32, @floatFromInt(td)) * @as(f32, @floatFromInt(cpu_bar)))));
             const n = @min(@max(1, sw), fl -| bp);
             if (n == 0) break;
             o += tui.wrs(buf[o..], tui.CPU_COLORS[ci]);
@@ -305,12 +303,12 @@ fn powerWidget(buf: []u8, power: *const PowerState, w: usize, chart_h: usize) !u
     }
 
     const Series = struct { rb: *const SampleRing, color: []const u8 };
-    var s = [1]Series{.{ .rb = &power.power_history, .color = tui.M }};
+    var s = [1]Series{.{ .rb = &power.power_history, .color = tui.OR }};
 
     var ann_buf: [64]u8 = undefined;
     var anns: [1][]const u8 = undefined;
     anns[0] = try std.fmt.bufPrint(&ann_buf, "{s}PWR:{s} {d: >5.1}W  max: {d:.1}W", .{
-        tui.M, tui.R, power.curr_watts, power.max_watts,
+        tui.OR, tui.R, power.curr_watts, power.max_watts,
     });
 
     var ymax_lbl: [8]u8 = undefined;
@@ -332,7 +330,7 @@ fn netWidget(buf: []u8, net: *const NetState, w: usize, half_h: usize) !usize {
 
     var title_buf: [80]u8 = undefined;
     var tmp: [16]u8 = undefined;
-    const title = try std.fmt.bufPrint(&title_buf, "Network — TX:{s} RX:{s}", .{
+    const title = try std.fmt.bufPrint(&title_buf, "Network — up:{s} dn:{s}", .{
         rateLabel(&tmp, net.tx_rate), rateLabel(tmp[8..], net.rx_rate),
     });
 
@@ -347,7 +345,7 @@ fn netWidget(buf: []u8, net: *const NetState, w: usize, half_h: usize) !usize {
     if (half_h == 0) {
         // Minimal: current rates annotation only, no chart.
         var ann: [64]u8 = undefined;
-        const al = (try std.fmt.bufPrint(&ann, "  TX:{s}  RX:{s}", .{
+        const al = (try std.fmt.bufPrint(&ann, "  up:{s}  dn:{s}", .{
             rateLabel(&tmp, net.tx_rate), rateLabel(tmp[8..], net.rx_rate),
         })).len;
         o += try tui.boxRow(buf[o..], ann[0..al], w);
@@ -437,7 +435,7 @@ fn netWidget(buf: []u8, net: *const NetState, w: usize, half_h: usize) !usize {
                 buf[o] = ' ';
                 o += 1;
             } else {
-                o += tui.wrs(buf[o..], tui.G);
+                o += tui.wrs(buf[o..], tui.BL);
                 o += tui.wrs(buf[o..], tui.BLOCKS[@intCast(in_row)]);
             }
         }
