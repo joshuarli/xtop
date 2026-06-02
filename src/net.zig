@@ -59,11 +59,9 @@ test "parseNetDev from fixture" {
 
     var net = NetState{};
     parseNetDev(&net, data);
-    // First parse: rates are 0 (no previous data)
     try std.testing.expectEqual(@as(u64, 0), net.rx_rate);
     try std.testing.expectEqual(@as(u64, 0), net.tx_rate);
 
-    // Second parse with same data: deltas should be 0 (same counters)
     parseNetDev(&net, data);
     try std.testing.expectEqual(@as(u64, 0), net.rx_rate);
 }

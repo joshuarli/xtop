@@ -1,39 +1,46 @@
 const std = @import("std");
-const types = @import("types.zig");
+const xtop = @import("xtop");
+const types = xtop.types;
 const linux = std.os.linux;
 
 const SystemCpu = types.SystemCpu;
 const MemState = types.MemState;
 const NetState = types.NetState;
+const PowerState = types.PowerState;
 const Process = types.Process;
-const RingBuffer = types.RingBuffer;
+const SampleRing = types.SampleRing;
 const TOP_N = types.TOP_N;
 
 const STDOUT_FD = std.posix.STDOUT_FILENO;
 
-const R  = "\x1b[0m";
-const BL = "\x1b[1;34m"; const G  = "\x1b[32m";  const RD = "\x1b[31m";
-const Y  = "\x1b[33m";    const M  = "\x1b[35m";  const C  = "\x1b[36m";
-const BG = "\x1b[1;90m";  const BW = "\x1b[1;37m"; const BU = "\x1b[34m";
+const R = "\x1b[0m";
+const BL = "\x1b[34m";
+const G = "\x1b[32m";
+const RD = "\x1b[31m";
+const Y = "\x1b[33m";
+const M = "\x1b[35m";
+const C = "\x1b[36m";
+const BW = "\x1b[1;37m";
 const BR = "\x1b[90m";
 
-const CPU_COLORS = [_][]const u8{ BL, G, RD, Y, M, C, C, BG };
+const CPU_COLORS = [_][]const u8{ BL, G, RD, Y, M, C, C, BR };
 
 const W: usize = 80;
-const CHART_H: usize = 4; // rows per chart (×8 levels = 32 vertical)
+const CHART_H: usize = 4;
 const CPU_COLS: usize = 4;
 const CPU_BAR: usize = 7;
 
-// 8-level block fill characters (0 = empty, 1-8 = ▁ through █)
 const BLOCKS = [_][]const u8{ " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 
 pub fn enterRawMode() !std.posix.termios {
     const orig = try std.posix.tcgetattr(STDOUT_FD);
     var raw = orig;
-    raw.lflag.ICANON = false; raw.lflag.ECHO = false;
-    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1; raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
     try std.posix.tcsetattr(STDOUT_FD, .FLUSH, raw);
-    _ = wfd(STDOUT_FD, "\x1b[?1049h\x1b[H");
+    _ = wfd(STDOUT_FD, "\x1b[?1049h\x1b[?25l\x1b[H");
     return orig;
 }
 
@@ -43,17 +50,23 @@ pub fn restoreTerminal(orig: std.posix.termios) void {
 }
 
 pub fn render(
-    sys: *const SystemCpu, mem: *const MemState, net: *const NetState,
-    procs: []const *const Process, sort_key: types.SortKey,
+    sys: *const SystemCpu,
+    mem: *const MemState,
+    net: *const NetState,
+    power: *const PowerState,
+    procs: []const *const Process,
+    sort_key: types.SortKey,
 ) !void {
-    var b: [65536]u8 = undefined;
+    // Render buffer sized for up to 1024 cores (~50KB CPU grid + charts + table).
+    var b: [131072]u8 = undefined;
     var o: usize = 0;
-    o += wrs(b[o..], "\n\x1b[H\x1b[2J");
+    o += wrs(b[o..], "\x1b[?2026h\x1b[H");
     o += try cpuBox(b[o..], sys);
     o += try memChart(b[o..], mem);
+    o += try powerChart(b[o..], power);
     o += try netChart(b[o..], net);
     o += try procTable(b[o..], procs, mem.total_kb);
-    o += (try std.fmt.bufPrint(b[o..], "\n  sort: {s} | c/m: sort  q: quit\x1b[K\x1b[J", .{if (sort_key == .cpu) "CPU" else "MEM"})).len;
+    o += (try std.fmt.bufPrint(b[o..], "\n  sort: {s} | c/m: sort  q: quit\x1b[K\x1b[J\x1b[?2026l", .{if (sort_key == .cpu) "CPU" else "MEM"})).len;
     _ = try writeAll(b[0..o]);
 }
 
@@ -63,38 +76,60 @@ fn boxTop(buf: []u8, title: []const u8, w: usize) !usize {
     var o: usize = 0;
     const dw = (w -| title.len -| 4) / 2;
     const dr = w -| title.len -| 4 -| dw;
-    o += wrs(buf[o..], BR); o += wrs(buf[o..], "┌");
-    var i: usize = 0; while (i < dw) : (i += 1) o += wrs(buf[o..], "─");
-    o += wrs(buf[o..], " "); o += wrs(buf[o..], BW); o += wrs(buf[o..], title);
-    o += wrs(buf[o..], BR); o += wrs(buf[o..], " ");
-    i = 0; while (i < dr) : (i += 1) o += wrs(buf[o..], "─");
+    o += wrs(buf[o..], BR);
+    o += wrs(buf[o..], "┌");
+    var i: usize = 0;
+    while (i < dw) : (i += 1) o += wrs(buf[o..], "─");
+    o += wrs(buf[o..], " ");
+    o += wrs(buf[o..], BW);
+    o += wrs(buf[o..], title);
+    o += wrs(buf[o..], BR);
+    o += wrs(buf[o..], " ");
+    i = 0;
+    while (i < dr) : (i += 1) o += wrs(buf[o..], "─");
     o += (try std.fmt.bufPrint(buf[o..], "┐{s}\n", .{R})).len;
     return o;
 }
 
 fn boxBottom(buf: []u8, w: usize) !usize {
     var o: usize = 0;
-    o += wrs(buf[o..], BR); o += wrs(buf[o..], "└");
-    var i: usize = 0; while (i < w - 2) : (i += 1) o += wrs(buf[o..], "─");
+    o += wrs(buf[o..], BR);
+    o += wrs(buf[o..], "└");
+    var i: usize = 0;
+    while (i < w - 2) : (i += 1) o += wrs(buf[o..], "─");
     o += (try std.fmt.bufPrint(buf[o..], "┘{s}\n", .{R})).len;
     return o;
 }
 
 fn boxRow(buf: []u8, content: []const u8, w: usize) !usize {
     var o: usize = 0;
-    o += wrs(buf[o..], BR); o += wrs(buf[o..], "│"); o += wrs(buf[o..], R);
+    o += wrs(buf[o..], BR);
+    o += wrs(buf[o..], "│");
+    o += wrs(buf[o..], R);
     o += wrs(buf[o..], content);
     const vw = visualW(content);
-    if (vw < w - 2) { var i: usize = 0; while (i < w - 2 - vw) : (i += 1) { buf[o] = ' '; o += 1; } }
+    if (vw < w - 2) {
+        var i: usize = 0;
+        while (i < w - 2 - vw) : (i += 1) {
+            buf[o] = ' ';
+            o += 1;
+        }
+    }
     o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ BR, R })).len;
     return o;
 }
 
 fn visualW(s: []const u8) usize {
-    var w: usize = 0; var i: usize = 0;
+    var w: usize = 0;
+    var i: usize = 0;
     while (i < s.len) {
-        if (s[i] == 0x1b) { while (i < s.len and s[i] != 'm') i += 1; if (i < s.len) i += 1; }
-        else { w += 1; i += 1; }
+        if (s[i] == 0x1b) {
+            while (i < s.len and s[i] != 'm') i += 1;
+            if (i < s.len) i += 1;
+        } else {
+            w += 1;
+            i += 1;
+        }
     }
     return w;
 }
@@ -102,7 +137,8 @@ fn visualW(s: []const u8) usize {
 // ─── CPU: htop-style pipe gauges ───
 
 fn cpuBox(buf: []u8, sys: *const SystemCpu) !usize {
-    var cb: [4096]u8 = undefined;
+    // 1024 cores × ~64 chars per gauge row = ~65KB worst case.
+    var cb: [65536]u8 = undefined;
     var cl: usize = 0;
     const ncols: usize = if (sys.num_cores > 16) CPU_COLS else 2;
     const rows = (sys.num_cores + ncols - 1) / ncols;
@@ -118,13 +154,17 @@ fn cpuBox(buf: []u8, sys: *const SystemCpu) !usize {
     var o: usize = 0;
     o += try boxTop(buf[o..], "CPU", W);
     var lines = std.mem.splitScalar(u8, cb[0..cl], '\n');
-    while (lines.next()) |line| { if (line.len == 0) continue; o += try boxRow(buf[o..], line, W); }
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        o += try boxRow(buf[o..], line, W);
+    }
     o += try boxBottom(buf[o..], W);
     return o;
 }
 
 fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize) !usize {
-    const core = sys.cores[i]; const prev = sys.prev_cores[i];
+    const core = sys.cores[i];
+    const prev = sys.prev_cores[i];
     const td = core.total() -| prev.total();
     const ad = if (td > 0) core.active() -| prev.active() else 0;
     const pct: f32 = if (td > 0) @as(f32, @floatFromInt(ad)) / @as(f32, @floatFromInt(td)) * 100.0 else 0;
@@ -142,29 +182,37 @@ fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize) !usize {
             const sw = @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(d)) / @as(f32, @floatFromInt(td)) * @as(f32, @floatFromInt(CPU_BAR)))));
             const n = @min(@max(1, sw), fl -| bp);
             if (n == 0) break;
-            o += wrs(buf[o..], CPU_COLORS[ci]); @memset(buf[o..o+n], '|'); o += n; bp += n;
+            o += wrs(buf[o..], CPU_COLORS[ci]);
+            @memset(buf[o .. o + n], '|');
+            o += n;
+            bp += n;
         }
     }
-    while (bp < fl) : (bp += 1) { buf[o] = ' '; o += 1; }
+    while (bp < fl) : (bp += 1) {
+        buf[o] = ' ';
+        o += 1;
+    }
     o += (try std.fmt.bufPrint(buf[o..], "{s}{s}]{s}", .{ BW, pt[0..ptl], R })).len;
     return o;
 }
 
-// ─── Solid block area chart (replaces braille, no alignment issues) ───
+// ─── Solid block area chart ───
 //
-// Renders a chart with solid `█` block characters forming a filled area.
+// Renders a chart with `█` block characters forming a filled area.
 // One char = one column = one time point. CHART_H rows of vertical resolution.
 
 fn renderChart(
-    buf: []u8, title: []const u8,
+    buf: []u8,
+    title: []const u8,
     series: anytype,
-    y_max_label: []const u8, y_min_label: []const u8,
-    rows_before: []const []const u8, // text lines to insert above the chart
+    y_max_label: []const u8,
+    y_min_label: []const u8,
+    rows_before: []const []const u8,
     w: usize,
 ) !usize {
     const n_series = series.len;
-    const y_w: usize = 5; // " 100%" or " 1.2M"
-    const n_cols = w -| 2 -| y_w; // data columns
+    const y_w: usize = 5;
+    const n_cols = w -| 2 -| y_w;
     if (n_cols < 4 or n_series == 0) return 0;
 
     // Right-aligned decimation for each series
@@ -176,7 +224,6 @@ fn renderChart(
     var o: usize = 0;
     o += try boxTop(buf[o..], title, w);
 
-    // Annotation lines before the chart
     for (rows_before) |line| {
         o += try boxRow(buf[o..], line, w);
     }
@@ -186,28 +233,43 @@ fn renderChart(
     for (0..CHART_H) |cr| {
         const row_bot = (CHART_H - 1 - cr) * 8;
 
-        o += wrs(buf[o..], BR); o += wrs(buf[o..], "│"); o += wrs(buf[o..], R);
+        o += wrs(buf[o..], BR);
+        o += wrs(buf[o..], "│");
+        o += wrs(buf[o..], R);
 
-        if (cr == 0) { o += wrs(buf[o..], y_max_label); }
-        else if (cr == CHART_H - 1) { o += wrs(buf[o..], y_min_label); }
-        else { var i: usize = 0; while (i < y_w) : (i += 1) { buf[o] = ' '; o += 1; } }
+        if (cr == 0) {
+            o += wrs(buf[o..], y_max_label);
+        } else if (cr == CHART_H - 1) {
+            o += wrs(buf[o..], y_min_label);
+        } else {
+            var i: usize = 0;
+            while (i < y_w) : (i += 1) {
+                buf[o] = ' ';
+                o += 1;
+            }
+        }
 
         for (0..n_cols) |ci| {
-            // Find max fill level across all series at this column
-            var max_fill: f32 = -1.0; // sentinel = no data
+            var max_fill: f32 = -1.0;
             var clr: ?[]const u8 = null;
             for (series, 0..) |s, si| {
                 const v = data[si][ci];
-                if (v >= 0 and v > max_fill) { max_fill = v; clr = s.color; }
+                if (v >= 0 and v > max_fill) {
+                    max_fill = v;
+                    clr = s.color;
+                }
             }
 
             if (max_fill < 0) {
-                buf[o] = ' '; o += 1;
+                buf[o] = ' ';
+                o += 1;
             } else {
                 const fill_lev = max_fill / 100.0 * @as(f32, @floatFromInt(total_lev));
-                const in_row = @max(0, @min(8, @as(isize, @intFromFloat(@round(fill_lev - @as(f32, @floatFromInt(row_bot))))) ));
-                if (in_row == 0) { buf[o] = ' '; o += 1; }
-                else {
+                const in_row = @max(0, @min(8, @as(isize, @intFromFloat(@round(fill_lev - @as(f32, @floatFromInt(row_bot)))))));
+                if (in_row == 0) {
+                    buf[o] = ' ';
+                    o += 1;
+                } else {
                     if (clr) |c| o += wrs(buf[o..], c);
                     o += wrs(buf[o..], BLOCKS[@intCast(in_row)]);
                 }
@@ -215,7 +277,13 @@ fn renderChart(
         }
 
         const used = 1 + y_w + n_cols + 1;
-        if (used < w) { var i: usize = 0; while (i < w - used) : (i += 1) { buf[o] = ' '; o += 1; } }
+        if (used < W) {
+            var i: usize = 0;
+            while (i < W - used) : (i += 1) {
+                buf[o] = ' ';
+                o += 1;
+            }
+        }
         o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ BR, R })).len;
     }
 
@@ -226,19 +294,27 @@ fn renderChart(
 fn padLabel(buf: []u8, s: []const u8, width: usize) []const u8 {
     const pad = width -| s.len;
     var o: usize = 0;
-    var i: usize = 0; while (i < pad) : (i += 1) { buf[o] = ' '; o += 1; }
-    @memcpy(buf[o..][0..s.len], s); o += s.len;
+    var i: usize = 0;
+    while (i < pad) : (i += 1) {
+        buf[o] = ' ';
+        o += 1;
+    }
+    @memcpy(buf[o..][0..s.len], s);
+    o += s.len;
     return buf[0..o];
 }
 
 // ─── Memory chart ───
 
 fn memChart(buf: []u8, mem: *const MemState) !usize {
-    const Series = struct { rb: *const RingBuffer, color: []const u8 };
+    const Series = struct { rb: *const SampleRing, color: []const u8 };
     var s: [2]Series = undefined;
     s[0] = .{ .rb = &mem.mem_history, .color = M };
     var n: usize = 1;
-    if (mem.swap_total_kb > 0) { s[1] = .{ .rb = &mem.swap_history, .color = Y }; n = 2; }
+    if (mem.swap_total_kb > 0) {
+        s[1] = .{ .rb = &mem.swap_history, .color = Y };
+        n = 2;
+    }
 
     const mu = mem.total_kb -| mem.avail_kb;
     const mp: f32 = if (mem.total_kb > 0) @as(f32, @floatFromInt(mu)) / @as(f32, @floatFromInt(mem.total_kb)) * 100.0 else 0;
@@ -264,12 +340,36 @@ fn memChart(buf: []u8, mem: *const MemState) !usize {
 
     var ymax: [8]u8 = undefined;
     var ymin: [8]u8 = undefined;
-    return renderChart(buf, "Memory", s[0..n],
-        padLabel(&ymax, "100%", 5), padLabel(&ymin, "  0%", 5),
-        anns[0..ann_count], W);
+    return renderChart(buf, "Memory", s[0..n], padLabel(&ymax, "100%", 5), padLabel(&ymin, "  0%", 5), anns[0..ann_count], W);
 }
 
-// ─── Network: reflected split chart (TX up, RX down) ───
+// ─── Power chart ───
+
+fn powerChart(buf: []u8, power: *const PowerState) !usize {
+    if (!power.has_perms) {
+        var o: usize = 0;
+        o += try boxTop(buf[o..], "Power", W);
+        o += try boxRow(buf[o..], "  (root required for power stats)", W);
+        o += try boxBottom(buf[o..], W);
+        return o;
+    }
+
+    const Series = struct { rb: *const SampleRing, color: []const u8 };
+    var s = [1]Series{.{ .rb = &power.power_history, .color = M }};
+
+    var ann_buf: [64]u8 = undefined;
+    var anns: [1][]const u8 = undefined;
+    anns[0] = try std.fmt.bufPrint(&ann_buf, "{s}PWR:{s} {d: >5.1}W  max: {d:.1}W", .{
+        M, R, power.curr_watts, power.max_watts,
+    });
+
+    var ymax_lbl: [8]u8 = undefined;
+    var ymin_lbl: [8]u8 = undefined;
+    var max_watts_buf: [8]u8 = undefined;
+    const max_watts_str = try std.fmt.bufPrint(&max_watts_buf, "{d:.0}W", .{power.max_watts});
+
+    return renderChart(buf, "Power", &s, padLabel(&ymax_lbl, max_watts_str, 5), padLabel(&ymin_lbl, "  0W", 5), &anns, W);
+}
 
 fn netChart(buf: []u8, net: *const NetState) !usize {
     const half_h: usize = 3;
@@ -279,13 +379,11 @@ fn netChart(buf: []u8, net: *const NetState) !usize {
 
     const max_rate: u64 = @max(@max(net.rx_rate, net.tx_rate), 1024);
 
-    // Decimate
     var tx_vals: [200]f32 = undefined;
     var rx_vals: [200]f32 = undefined;
     decimate(&tx_vals, n_cols, &net.tx_history);
     decimate(&rx_vals, n_cols, &net.rx_history);
 
-    // Title
     var title_buf: [80]u8 = undefined;
     var tmp: [16]u8 = undefined;
     const title = try std.fmt.bufPrint(&title_buf, "Network — TX:{s} RX:{s}", .{
@@ -300,53 +398,95 @@ fn netChart(buf: []u8, net: *const NetState) !usize {
     var o: usize = 0;
     o += try boxTop(buf[o..], title, W);
 
-    // TX (top half) — 8 sub-levels per row
     const tx_lev = half_h * 8;
     for (0..half_h) |cr| {
         const row_bot = (half_h - 1 - cr) * 8;
-        o += wrs(buf[o..], BR); o += wrs(buf[o..], "│"); o += wrs(buf[o..], R);
+        o += wrs(buf[o..], BR);
+        o += wrs(buf[o..], "│");
+        o += wrs(buf[o..], R);
         o += if (cr == 0) wrs(buf[o..], max_label) else wrs(buf[o..], "     ");
 
         for (0..n_cols) |ci| {
-            if (tx_vals[ci] < 0) { buf[o] = ' '; o += 1; continue; }
+            if (tx_vals[ci] < 0) {
+                buf[o] = ' ';
+                o += 1;
+                continue;
+            }
             const v = tx_vals[ci] / 100.0 * @as(f32, @floatFromInt(max_rate));
             const frac = v / @as(f32, @floatFromInt(max_rate));
             const fill = frac * @as(f32, @floatFromInt(tx_lev));
             const in_row = @max(0, @min(8, @as(isize, @intFromFloat(@round(fill - @as(f32, @floatFromInt(row_bot)))))));
-            if (in_row == 0) { buf[o] = ' '; o += 1; }
-            else { o += wrs(buf[o..], RD); o += wrs(buf[o..], BLOCKS[@intCast(in_row)]); }
+            if (in_row == 0) {
+                buf[o] = ' ';
+                o += 1;
+            } else {
+                o += wrs(buf[o..], RD);
+                o += wrs(buf[o..], BLOCKS[@intCast(in_row)]);
+            }
         }
         const used = 1 + y_w + n_cols + 1;
-        if (used < W) { var i: usize = 0; while (i < W - used) : (i += 1) { buf[o] = ' '; o += 1; } }
+        if (used < W) {
+            var i: usize = 0;
+            while (i < W - used) : (i += 1) {
+                buf[o] = ' ';
+                o += 1;
+            }
+        }
         o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ BR, R })).len;
     }
 
     // Center divider
-    o += wrs(buf[o..], BR); o += wrs(buf[o..], "│"); o += wrs(buf[o..], R);
-    o += wrs(buf[o..], "    0"); o += wrs(buf[o..], BR);
-    var di: usize = 0; while (di < n_cols) : (di += 1) o += wrs(buf[o..], "─");
+    o += wrs(buf[o..], BR);
+    o += wrs(buf[o..], "│");
+    o += wrs(buf[o..], R);
+    o += wrs(buf[o..], "    0");
+    o += wrs(buf[o..], BR);
+    var di: usize = 0;
+    while (di < n_cols) : (di += 1) o += wrs(buf[o..], "─");
     o += wrs(buf[o..], R);
     const used_c = 1 + y_w + n_cols + 1;
-    if (used_c < W) { var i: usize = 0; while (i < W - used_c) : (i += 1) { buf[o] = ' '; o += 1; } }
+    if (used_c < W) {
+        var i: usize = 0;
+        while (i < W - used_c) : (i += 1) {
+            buf[o] = ' ';
+            o += 1;
+        }
+    }
     o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ BR, R })).len;
 
-    // RX (bottom half, reflected) — 8 sub-levels per row
     for (0..half_h) |cr| {
         const row_bot = cr * 8;
-        o += wrs(buf[o..], BR); o += wrs(buf[o..], "│"); o += wrs(buf[o..], R);
+        o += wrs(buf[o..], BR);
+        o += wrs(buf[o..], "│");
+        o += wrs(buf[o..], R);
         o += if (cr == half_h - 1) wrs(buf[o..], max_label) else wrs(buf[o..], "     ");
 
         for (0..n_cols) |ci| {
-            if (rx_vals[ci] < 0) { buf[o] = ' '; o += 1; continue; }
+            if (rx_vals[ci] < 0) {
+                buf[o] = ' ';
+                o += 1;
+                continue;
+            }
             const v = rx_vals[ci] / 100.0 * @as(f32, @floatFromInt(max_rate));
             const frac = v / @as(f32, @floatFromInt(max_rate));
             const fill = frac * @as(f32, @floatFromInt(tx_lev));
             const in_row = @max(0, @min(8, @as(isize, @intFromFloat(@round(fill - @as(f32, @floatFromInt(row_bot)))))));
-            if (in_row == 0) { buf[o] = ' '; o += 1; }
-            else { o += wrs(buf[o..], G); o += wrs(buf[o..], BLOCKS[@intCast(in_row)]); }
+            if (in_row == 0) {
+                buf[o] = ' ';
+                o += 1;
+            } else {
+                o += wrs(buf[o..], G);
+                o += wrs(buf[o..], BLOCKS[@intCast(in_row)]);
+            }
         }
         const used = 1 + y_w + n_cols + 1;
-        if (used < W) { var i: usize = 0; while (i < W - used) : (i += 1) { buf[o] = ' '; o += 1; } }
+        if (used < W) {
+            var i: usize = 0;
+            while (i < W - used) : (i += 1) {
+                buf[o] = ' ';
+                o += 1;
+            }
+        }
         o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ BR, R })).len;
     }
 
@@ -354,25 +494,27 @@ fn netChart(buf: []u8, net: *const NetState) !usize {
     return o;
 }
 
-fn decimate(out: []f32, n: usize, rb: *const RingBuffer) void {
-    // Fill with -1 sentinel first (no data)
-    for (0..n) |j| { out[j] = -1.0; }
-    var raw: [300]f32 = undefined;
-    const vals = rb.lastN(@min(300, rb.len), &raw);
+/// Decimate a SampleRing's cpu_pct values into `out[0..n]`. Right-aligned:
+/// if fewer than n samples exist, they appear at the right end. Unfilled
+/// slots on the left are set to -1.0 (sentinel for "no data").
+fn decimate(out: []f32, n: usize, rb: *const SampleRing) void {
+    for (0..n) |j| {
+        out[j] = -1.0;
+    }
+    var raw: [types.RING_SIZE]types.Sample = undefined;
+    const vals = rb.lastN(@min(types.RING_SIZE, rb.len), &raw);
     if (vals.len < 2) return;
-    // Right-align: place available data at the right end of out[]
     const start = n -| vals.len;
     for (vals, 0..) |v, i| {
-        if (start + i < n) out[start + i] = v;
+        if (start + i < n) out[start + i] = v.cpu_pct;
     }
 }
 
 fn rateLabel(buf: []u8, bps: u64) []const u8 {
-    const label = if (bps < 1024) std.fmt.bufPrint(buf, "{d: >4}B", .{bps})
-        else if (bps < 1024 * 1024) std.fmt.bufPrint(buf, "{d:.1}K", .{@as(f32, @floatFromInt(bps)) / 1024.0})
-        else std.fmt.bufPrint(buf, "{d:.1}M", .{@as(f32, @floatFromInt(bps)) / (1024.0 * 1024.0)});
+    const label = if (bps < 1024) std.fmt.bufPrint(buf, "{d: >4}B", .{bps}) else if (bps < 1024 * 1024) std.fmt.bufPrint(buf, "{d:.1}K", .{@as(f32, @floatFromInt(bps)) / 1024.0}) else std.fmt.bufPrint(buf, "{d:.1}M", .{@as(f32, @floatFromInt(bps)) / (1024.0 * 1024.0)});
     return label catch {
-        @memcpy(buf[0..5], "   0B"); return buf[0..5];
+        @memcpy(buf[0..5], "   0B");
+        return buf[0..5];
     };
 }
 
@@ -395,15 +537,22 @@ fn procTable(buf: []u8, procs: []const *const Process, total_mem_kb: u64) !usize
         const mp: f32 = if (total_mem_kb > 0) @as(f32, @floatFromInt(proc.rss_kb)) / @as(f32, @floatFromInt(total_mem_kb)) * 100.0 else 0;
         o += (try std.fmt.bufPrint(buf[o..], "  {d: >6}  ", .{proc.pid})).len;
         const nm = proc.name[0..@min(proc.name_len, 15)];
-        @memcpy(buf[o..][0..nm.len], nm); o += nm.len;
-        var p: usize = nm.len; while (p < 15) : (p += 1) { buf[o] = ' '; o += 1; }
-        buf[o] = ' '; o += 1;
+        @memcpy(buf[o..][0..nm.len], nm);
+        o += nm.len;
+        var p: usize = nm.len;
+        while (p < 15) : (p += 1) {
+            buf[o] = ' ';
+            o += 1;
+        }
+        buf[o] = ' ';
+        o += 1;
         o += (try std.fmt.bufPrint(buf[o..], "{d: >5.1}  {d: >5.1}  ", .{ @min(proc.cpu_pct, 999.9), @min(mp, 999.9) })).len;
         o += try fmtRate(buf[o..], proc.read_rate);
         o += wrs(buf[o..], "   ");
         o += try fmtRate(buf[o..], proc.write_rate);
         o += wrs(buf[o..], "   ");
-        buf[o] = '\n'; o += 1;
+        buf[o] = '\n';
+        o += 1;
     }
     return o;
 }
@@ -411,21 +560,28 @@ fn procTable(buf: []u8, procs: []const *const Process, total_mem_kb: u64) !usize
 fn fmtRate(buf: []u8, bps: u64) !usize {
     if (bps == 0) return (try std.fmt.bufPrint(buf, "    0 ", .{})).len;
     if (bps < 1024) return (try std.fmt.bufPrint(buf, "{d: >4}B ", .{bps})).len;
-    if (bps < 1024*1024) return (try std.fmt.bufPrint(buf, "{d: >4}K", .{bps/1024})).len;
-    return (try std.fmt.bufPrint(buf, "{d: >4}M", .{bps/(1024*1024)})).len;
+    if (bps < 1024 * 1024) return (try std.fmt.bufPrint(buf, "{d: >4}K", .{bps / 1024})).len;
+    return (try std.fmt.bufPrint(buf, "{d: >4}M", .{bps / (1024 * 1024)})).len;
 }
 
 // ─── I/O ───
 
-fn wrs(buf: []u8, s: []const u8) usize { @memcpy(buf[0..s.len], s); return s.len; }
+fn wrs(buf: []u8, s: []const u8) usize {
+    @memcpy(buf[0..s.len], s);
+    return s.len;
+}
 
 fn writeAll(bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
         const r = linux.write(STDOUT_FD, bytes.ptr + off, bytes.len - off);
         const s: isize = @bitCast(r);
-        if (s < 0) { if (s == -@as(isize, @intFromEnum(linux.E.INTR))) continue; return error.IoError; }
-        if (r == 0) return error.Closed; off += r;
+        if (s < 0) {
+            if (s == -@as(isize, @intFromEnum(linux.E.INTR))) continue;
+            return error.IoError;
+        }
+        if (r == 0) return error.Closed;
+        off += r;
     }
 }
 
