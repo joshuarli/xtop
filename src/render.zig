@@ -25,12 +25,17 @@ const BR = "\x1b[90m";
 
 const CPU_COLORS = [_][]const u8{ BL, G, RD, Y, M, C, C, BR };
 
-const W: usize = 80;
 const CHART_H: usize = 4;
-const CPU_COLS: usize = 4;
 const CPU_BAR: usize = 7;
 
 const BLOCKS = [_][]const u8{ " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+
+fn getTermWidth() usize {
+    var ws: std.posix.winsize = @bitCast(@as(u64, 0));
+    const rc = linux.ioctl(STDOUT_FD, linux.T.IOCGWINSZ, @intFromPtr(&ws));
+    if (rc != 0) return 80;
+    return @max(20, @as(usize, ws.col));
+}
 
 pub fn enterRawMode() !std.posix.termios {
     const orig = try std.posix.tcgetattr(STDOUT_FD);
@@ -57,15 +62,16 @@ pub fn render(
     procs: []const *const Process,
     sort_key: types.SortKey,
 ) !void {
+    const w = getTermWidth();
     // Render buffer sized for up to 1024 cores (~50KB CPU grid + charts + table).
     var b: [131072]u8 = undefined;
     var o: usize = 0;
     o += wrs(b[o..], "\x1b[?2026h\x1b[H");
-    o += try cpuBox(b[o..], sys);
-    o += try memChart(b[o..], mem);
-    o += try powerChart(b[o..], power);
-    o += try netChart(b[o..], net);
-    o += try procTable(b[o..], procs, mem.total_kb);
+    o += try cpuBox(b[o..], sys, w);
+    o += try memChart(b[o..], mem, w);
+    o += try powerChart(b[o..], power, w);
+    o += try netChart(b[o..], net, w);
+    o += try procTable(b[o..], procs, mem.total_kb, w);
     o += (try std.fmt.bufPrint(b[o..], "\n  sort: {s} | c/m: sort  q: quit\x1b[K\x1b[J\x1b[?2026l", .{if (sort_key == .cpu) "CPU" else "MEM"})).len;
     _ = try writeAll(b[0..o]);
 }
@@ -106,14 +112,16 @@ fn boxRow(buf: []u8, content: []const u8, w: usize) !usize {
     o += wrs(buf[o..], BR);
     o += wrs(buf[o..], "│");
     o += wrs(buf[o..], R);
-    o += wrs(buf[o..], content);
     const vw = visualW(content);
-    if (vw < w - 2) {
+    if (vw <= w - 2) {
+        o += wrs(buf[o..], content);
         var i: usize = 0;
         while (i < w - 2 - vw) : (i += 1) {
             buf[o] = ' ';
             o += 1;
         }
+    } else {
+        o += writeVisualTrunc(buf[o..], content, w - 2);
     }
     o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ BR, R })).len;
     return o;
@@ -134,13 +142,40 @@ fn visualW(s: []const u8) usize {
     return w;
 }
 
+/// Write at most max_visual visual characters from s into buf, preserving ANSI
+/// escape sequences and appending a reset code.
+fn writeVisualTrunc(buf: []u8, s: []const u8, max_visual: usize) usize {
+    var o: usize = 0;
+    var vw: usize = 0;
+    var i: usize = 0;
+    while (i < s.len and vw < max_visual) {
+        if (s[i] == 0x1b) {
+            const start = i;
+            while (i < s.len and s[i] != 'm') i += 1;
+            if (i < s.len) i += 1;
+            const seq = s[start..i];
+            @memcpy(buf[o..][0..seq.len], seq);
+            o += seq.len;
+        } else {
+            buf[o] = s[i];
+            o += 1;
+            vw += 1;
+            i += 1;
+        }
+    }
+    o += wrs(buf[o..], R);
+    return o;
+}
+
 // ─── CPU: htop-style pipe gauges ───
 
-fn cpuBox(buf: []u8, sys: *const SystemCpu) !usize {
+fn cpuBox(buf: []u8, sys: *const SystemCpu, w: usize) !usize {
     // 1024 cores × ~64 chars per gauge row = ~65KB worst case.
     var cb: [65536]u8 = undefined;
     var cl: usize = 0;
-    const ncols: usize = if (sys.num_cores > 16) CPU_COLS else 2;
+    const box_inner = w -| 2;
+    const gauge_w: usize = 17;
+    const ncols: usize = @max(1, box_inner / gauge_w);
     const rows = (sys.num_cores + ncols - 1) / ncols;
     for (0..rows) |row| {
         for (0..ncols) |ci| {
@@ -152,13 +187,13 @@ fn cpuBox(buf: []u8, sys: *const SystemCpu) !usize {
         cl += wrs(cb[cl..], "\n");
     }
     var o: usize = 0;
-    o += try boxTop(buf[o..], "CPU", W);
+    o += try boxTop(buf[o..], "CPU", w);
     var lines = std.mem.splitScalar(u8, cb[0..cl], '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        o += try boxRow(buf[o..], line, W);
+        o += try boxRow(buf[o..], line, w);
     }
-    o += try boxBottom(buf[o..], W);
+    o += try boxBottom(buf[o..], w);
     return o;
 }
 
@@ -277,9 +312,9 @@ fn renderChart(
         }
 
         const used = 1 + y_w + n_cols + 1;
-        if (used < W) {
+        if (used < w) {
             var i: usize = 0;
-            while (i < W - used) : (i += 1) {
+            while (i < w - used) : (i += 1) {
                 buf[o] = ' ';
                 o += 1;
             }
@@ -306,7 +341,7 @@ fn padLabel(buf: []u8, s: []const u8, width: usize) []const u8 {
 
 // ─── Memory chart ───
 
-fn memChart(buf: []u8, mem: *const MemState) !usize {
+fn memChart(buf: []u8, mem: *const MemState, w: usize) !usize {
     const Series = struct { rb: *const SampleRing, color: []const u8 };
     var s: [2]Series = undefined;
     s[0] = .{ .rb = &mem.mem_history, .color = M };
@@ -340,17 +375,17 @@ fn memChart(buf: []u8, mem: *const MemState) !usize {
 
     var ymax: [8]u8 = undefined;
     var ymin: [8]u8 = undefined;
-    return renderChart(buf, "Memory", s[0..n], padLabel(&ymax, "100%", 5), padLabel(&ymin, "  0%", 5), anns[0..ann_count], W);
+    return renderChart(buf, "Memory", s[0..n], padLabel(&ymax, "100%", 5), padLabel(&ymin, "  0%", 5), anns[0..ann_count], w);
 }
 
 // ─── Power chart ───
 
-fn powerChart(buf: []u8, power: *const PowerState) !usize {
+fn powerChart(buf: []u8, power: *const PowerState, w: usize) !usize {
     if (!power.has_perms) {
         var o: usize = 0;
-        o += try boxTop(buf[o..], "Power", W);
-        o += try boxRow(buf[o..], "  (root required for power stats)", W);
-        o += try boxBottom(buf[o..], W);
+        o += try boxTop(buf[o..], "Power", w);
+        o += try boxRow(buf[o..], "  (root required for power stats)", w);
+        o += try boxBottom(buf[o..], w);
         return o;
     }
 
@@ -368,13 +403,13 @@ fn powerChart(buf: []u8, power: *const PowerState) !usize {
     var max_watts_buf: [8]u8 = undefined;
     const max_watts_str = try std.fmt.bufPrint(&max_watts_buf, "{d:.0}W", .{power.max_watts});
 
-    return renderChart(buf, "Power", &s, padLabel(&ymax_lbl, max_watts_str, 5), padLabel(&ymin_lbl, "  0W", 5), &anns, W);
+    return renderChart(buf, "Power", &s, padLabel(&ymax_lbl, max_watts_str, 5), padLabel(&ymin_lbl, "  0W", 5), &anns, w);
 }
 
-fn netChart(buf: []u8, net: *const NetState) !usize {
+fn netChart(buf: []u8, net: *const NetState, w: usize) !usize {
     const half_h: usize = 3;
     const y_w: usize = 5;
-    const n_cols = W -| 2 -| y_w;
+    const n_cols = w -| 2 -| y_w;
     if (n_cols < 4) return 0;
 
     const max_rate: u64 = @max(@max(net.rx_rate, net.tx_rate), 1024);
@@ -396,7 +431,7 @@ fn netChart(buf: []u8, net: *const NetState) !usize {
     const max_label = padLabel(&max_pad, max_lbl, y_w);
 
     var o: usize = 0;
-    o += try boxTop(buf[o..], title, W);
+    o += try boxTop(buf[o..], title, w);
 
     const tx_lev = half_h * 8;
     for (0..half_h) |cr| {
@@ -425,9 +460,9 @@ fn netChart(buf: []u8, net: *const NetState) !usize {
             }
         }
         const used = 1 + y_w + n_cols + 1;
-        if (used < W) {
+        if (used < w) {
             var i: usize = 0;
-            while (i < W - used) : (i += 1) {
+            while (i < w - used) : (i += 1) {
                 buf[o] = ' ';
                 o += 1;
             }
@@ -445,9 +480,9 @@ fn netChart(buf: []u8, net: *const NetState) !usize {
     while (di < n_cols) : (di += 1) o += wrs(buf[o..], "─");
     o += wrs(buf[o..], R);
     const used_c = 1 + y_w + n_cols + 1;
-    if (used_c < W) {
+    if (used_c < w) {
         var i: usize = 0;
-        while (i < W - used_c) : (i += 1) {
+        while (i < w - used_c) : (i += 1) {
             buf[o] = ' ';
             o += 1;
         }
@@ -480,9 +515,9 @@ fn netChart(buf: []u8, net: *const NetState) !usize {
             }
         }
         const used = 1 + y_w + n_cols + 1;
-        if (used < W) {
+        if (used < w) {
             var i: usize = 0;
-            while (i < W - used) : (i += 1) {
+            while (i < w - used) : (i += 1) {
                 buf[o] = ' ';
                 o += 1;
             }
@@ -490,7 +525,7 @@ fn netChart(buf: []u8, net: *const NetState) !usize {
         o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ BR, R })).len;
     }
 
-    o += try boxBottom(buf[o..], W);
+    o += try boxBottom(buf[o..], w);
     return o;
 }
 
@@ -528,31 +563,64 @@ fn fsize(buf: []u8, kb: u64) []const u8 {
 
 // ─── Process table ───
 
-fn procTable(buf: []u8, procs: []const *const Process, total_mem_kb: u64) !usize {
+fn procTable(buf: []u8, procs: []const *const Process, total_mem_kb: u64, w: usize) !usize {
     var o: usize = 0;
-    o += wrs(buf[o..], "\n  PID    NAME             CPU%   MEM%   R/s     W/s\n");
-    o += wrs(buf[o..], "  -----------------------------------------------------\n");
+    const show_io = w >= 65;
+    const name_w: usize = if (show_io) @max(4, @min(15, w -| 39)) else @max(4, @min(15, w -| 25));
+
+    // Header
+    o += wrs(buf[o..], "\n  PID    ");
+    o += writePaddedName(buf[o..], "NAME", name_w);
+    if (show_io) {
+        o += wrs(buf[o..], " CPU%   MEM%   R/s     W/s\n  ");
+    } else {
+        o += wrs(buf[o..], " CPU%   MEM%\n  ");
+    }
+
+    // Divider
+    const div_w: usize = if (show_io) 6 + 2 + name_w + 1 + 5 + 2 + 5 + 2 + 5 + 2 + 5 else 6 + 2 + name_w + 1 + 5 + 2 + 5;
+    var di: usize = 0;
+    while (di < div_w) : (di += 1) {
+        buf[o] = '-';
+        o += 1;
+    }
+    buf[o] = '\n';
+    o += 1;
+
     for (procs, 0..) |proc, i| {
         if (i >= TOP_N) break;
         const mp: f32 = if (total_mem_kb > 0) @as(f32, @floatFromInt(proc.rss_kb)) / @as(f32, @floatFromInt(total_mem_kb)) * 100.0 else 0;
         o += (try std.fmt.bufPrint(buf[o..], "  {d: >6}  ", .{proc.pid})).len;
-        const nm = proc.name[0..@min(proc.name_len, 15)];
+        const nm = proc.name[0..@min(proc.name_len, name_w)];
         @memcpy(buf[o..][0..nm.len], nm);
         o += nm.len;
         var p: usize = nm.len;
-        while (p < 15) : (p += 1) {
+        while (p < name_w) : (p += 1) {
             buf[o] = ' ';
             o += 1;
         }
         buf[o] = ' ';
         o += 1;
-        o += (try std.fmt.bufPrint(buf[o..], "{d: >5.1}  {d: >5.1}  ", .{ @min(proc.cpu_pct, 999.9), @min(mp, 999.9) })).len;
-        o += try fmtRate(buf[o..], proc.read_rate);
-        o += wrs(buf[o..], "   ");
-        o += try fmtRate(buf[o..], proc.write_rate);
+        o += (try std.fmt.bufPrint(buf[o..], "{d: >5.1}  {d: >5.1}", .{ @min(proc.cpu_pct, 999.9), @min(mp, 999.9) })).len;
+        if (show_io) {
+            o += wrs(buf[o..], "   ");
+            o += try fmtRate(buf[o..], proc.read_rate);
+            o += wrs(buf[o..], "   ");
+            o += try fmtRate(buf[o..], proc.write_rate);
+        }
         o += wrs(buf[o..], "   ");
         buf[o] = '\n';
         o += 1;
+    }
+    return o;
+}
+
+fn writePaddedName(buf: []u8, name: []const u8, width: usize) usize {
+    const n = @min(name.len, width);
+    @memcpy(buf[0..n], name[0..n]);
+    var o: usize = n;
+    while (o < width) : (o += 1) {
+        buf[o] = ' ';
     }
     return o;
 }
