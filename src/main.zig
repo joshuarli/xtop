@@ -109,10 +109,6 @@ pub fn main(init: std.process.Init) !void {
         switch (pressed) {
             'c' => sort_key = .cpu,
             'm' => sort_key = .mem,
-            'q' => {
-                @branchHint(.unlikely);
-                shutdown_flag.store(true, .release);
-            },
             else => {},
         }
         if (shutdown_flag.load(.acquire)) break;
@@ -241,11 +237,11 @@ fn inputThreadFn() void {
     while (!shutdown_flag.load(.acquire)) {
         const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch continue;
         if (n == 1) {
-            key_event.store(buf[0], .monotonic);
-            if (buf[0] == 'q') {
-                shutdown_flag.store(true, .release);
-                return;
+            if (buf[0] == 'q' or buf[0] == 0x03) {
+                if (saved_termios) |t| tui.restoreTerminal(t);
+                std.process.exit(0);
             }
+            key_event.store(buf[0], .monotonic);
         }
     }
 }
@@ -266,7 +262,8 @@ fn sigwinchHandler(_: std.posix.SIG) callconv(.c) void {
     resize_flag.store(true, .monotonic);
 }
 fn sigtermHandler(_: std.posix.SIG) callconv(.c) void {
-    shutdown_flag.store(true, .release);
+    if (saved_termios) |t| tui.restoreTerminal(t);
+    linux.exit_group(0);
 }
 fn sigtstpHandler(_: std.posix.SIG) callconv(.c) void {
     if (saved_termios) |t| {
