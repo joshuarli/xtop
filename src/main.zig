@@ -26,6 +26,7 @@ const ProcessKey = store.ProcessKey;
 const ProcessMap = store.ProcessMap;
 const PidMap = store.PidMap;
 const render = @import("render.zig");
+const tui = @import("tui.zig");
 
 var shutdown_flag = std.atomic.Value(bool).init(false);
 var resize_flag = std.atomic.Value(bool).init(false);
@@ -67,8 +68,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const original_termios = try render.enterRawMode();
-    defer render.restoreTerminal(original_termios);
+    const original_termios = try tui.enterRawMode();
+    defer tui.restoreTerminal(original_termios);
     saved_termios = original_termios;
     setupSignals();
 
