@@ -14,6 +14,65 @@ const TOP_N = types.TOP_N;
 const CHART_H_MAX: usize = 4;
 const HALF_H_MAX: usize = 3;
 const MIN_GAUGE_W: usize = 22;
+const CHART_ROW_END = tui.BR ++ "│" ++ tui.R ++ "\n";
+
+/// Write decimal `val` right-aligned in at least `min_width` chars.
+/// Returns bytes written (may exceed min_width for large values).
+fn fmtUintRight(buf: []u8, val: u64, min_width: usize) usize {
+    var tmp: [20]u8 = undefined;
+    var i: usize = tmp.len;
+    var v = val;
+    while (true) {
+        i -= 1;
+        tmp[i] = @as(u8, @intCast(v % 10)) + '0';
+        v /= 10;
+        if (v == 0) break;
+    }
+    const n = tmp.len - i;
+    const pad = min_width -| n;
+    @memset(buf[0..pad], ' ');
+    @memcpy(buf[pad..][0..n], tmp[i..]);
+    return pad + n;
+}
+
+/// Write `val` with `decimals` fractional digits, right-aligned in at least
+/// `min_width` chars. Returns bytes written. `decimals` is comptime-known.
+fn fmtFloatRight(buf: []u8, val: f32, min_width: usize, comptime decimals: usize) usize {
+    const mult = comptime std.math.pow(f32, 10.0, @floatFromInt(decimals));
+    const scaled = @as(u64, @intFromFloat(@round(@abs(val) * mult)));
+    const pow10 = comptime std.math.pow(u64, 10, decimals);
+    const int_part = scaled / pow10;
+    const frac_part = scaled % pow10;
+
+    var tmp: [20]u8 = undefined;
+    var i: usize = tmp.len;
+    var v = int_part;
+    while (true) {
+        i -= 1;
+        tmp[i] = @as(u8, @intCast(v % 10)) + '0';
+        v /= 10;
+        if (v == 0) break;
+    }
+    const int_slice = tmp[i..];
+
+    var frac_buf: [10]u8 = undefined;
+    var j: usize = decimals;
+    var fv = frac_part;
+    while (j > 0) {
+        j -= 1;
+        frac_buf[j] = @as(u8, @intCast(fv % 10)) + '0';
+        fv /= 10;
+    }
+
+    const total = int_slice.len + 1 + decimals;
+    const pad = min_width -| total;
+
+    @memset(buf[0..pad], ' ');
+    @memcpy(buf[pad..][0..int_slice.len], int_slice);
+    buf[pad + int_slice.len] = '.';
+    @memcpy(buf[pad + int_slice.len + 1 ..][0..decimals], frac_buf[0..decimals]);
+    return pad + total;
+}
 
 pub fn render(
     sys: *const SystemCpu,
@@ -109,7 +168,9 @@ pub fn renderToBuf(
     o += try powerWidget(buf[o..], power, w, pwr_chart_h);
     o += try netWidget(buf[o..], net, w, net_half_h);
     o += try procWidget(buf[o..], procs, mem.total_kb, w, proc_max_rows);
-    o += (try std.fmt.bufPrint(buf[o..], "  sort: {s} | c/m: sort  q: quit\x1b[K\x1b[J\x1b[?2026l", .{if (sort_key == .cpu) "CPU" else "MEM"})).len;
+    o += tui.wrs(buf[o..], "  sort: ");
+    o += tui.wrs(buf[o..], if (sort_key == .cpu) "CPU" else "MEM");
+    o += tui.wrs(buf[o..], " | c/m: sort  q: quit\x1b[K\x1b[J\x1b[?2026l");
     return buf[0..o];
 }
 
@@ -146,12 +207,18 @@ fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize, gauge_w: usize) !usize {
     const ad = if (td > 0) core.active() -| prev.active() else 0;
     const pct: f32 = if (td > 0) @as(f32, @floatFromInt(ad)) / @as(f32, @floatFromInt(td)) * 100.0 else 0;
 
-    var pt: [6]u8 = undefined;
-    const ptl = (try std.fmt.bufPrint(&pt, "{d: >4.1}%", .{@min(pct, 999.9)})).len;
+    var pt: [7]u8 = undefined;
+    const pt_n = fmtFloatRight(&pt, @min(pct, 999.9), 4, 1);
+    pt[pt_n] = '%';
+    const ptl = pt_n + 1;
     const cpu_bar = gauge_w -| 5;
     const fl = cpu_bar -| ptl;
     var o: usize = 0;
-    o += (try std.fmt.bufPrint(buf[o..], "{s}{d: >3}{s}[", .{ tui.C, i, tui.R })).len;
+    o += tui.wrs(buf[o..], tui.C);
+    o += fmtUintRight(buf[o..], i, 3);
+    o += tui.wrs(buf[o..], tui.R);
+    buf[o] = '[';
+    o += 1;
     var bp: usize = 0;
     if (td > 0) {
         const ds = [_]u64{ core.nice -| prev.nice, core.user -| prev.user, core.system -| prev.system, core.irq -| prev.irq, core.softirq -| prev.softirq, core.steal -| prev.steal, core.guest -| prev.guest, core.iowait -| prev.iowait };
@@ -166,11 +233,15 @@ fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize, gauge_w: usize) !usize {
             bp += n;
         }
     }
-    while (bp < fl) : (bp += 1) {
-        buf[o] = ' ';
-        o += 1;
-    }
-    o += (try std.fmt.bufPrint(buf[o..], "{s}{s}]{s}", .{ tui.BW, pt[0..ptl], tui.R })).len;
+    const remain = fl -| bp;
+    @memset(buf[o .. o + remain], ' ');
+    o += remain;
+    o += tui.wrs(buf[o..], tui.BW);
+    @memcpy(buf[o..][0..ptl], pt[0..ptl]);
+    o += ptl;
+    buf[o] = ']';
+    o += 1;
+    o += tui.wrs(buf[o..], tui.R);
     return o;
 }
 
@@ -223,11 +294,8 @@ fn renderChart(
         } else if (cr == chart_h - 1) {
             o += tui.wrs(buf[o..], y_min_label);
         } else {
-            var i: usize = 0;
-            while (i < y_w) : (i += 1) {
-                buf[o] = ' ';
-                o += 1;
-            }
+            @memset(buf[o .. o + y_w], ' ');
+            o += y_w;
         }
 
         for (0..n_cols) |ci| {
@@ -259,13 +327,10 @@ fn renderChart(
 
         const used = 1 + y_w + n_cols + 1;
         if (used < w) {
-            var i: usize = 0;
-            while (i < w - used) : (i += 1) {
-                buf[o] = ' ';
-                o += 1;
-            }
+            @memset(buf[o .. o + (w - used)], ' ');
+            o += w - used;
         }
-        o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ tui.BR, tui.R })).len;
+        o += tui.wrs(buf[o..], CHART_ROW_END);
     }
 
     o += try tui.boxBottom(buf[o..], w);
@@ -334,7 +399,9 @@ pub fn powerWidget(buf: []u8, power: *const PowerState, w: usize, chart_h: usize
     var ymax_lbl: [8]u8 = undefined;
     var ymin_lbl: [8]u8 = undefined;
     var max_watts_buf: [8]u8 = undefined;
-    const max_watts_str = try std.fmt.bufPrint(&max_watts_buf, "{d:.0}W", .{power.max_watts});
+    const mwn = fmtUintRight(&max_watts_buf, @as(u64, @intFromFloat(@round(power.max_watts))), 0);
+    max_watts_buf[mwn] = 'W';
+    const max_watts_str = max_watts_buf[0..mwn + 1];
 
     return renderChart(buf, "Power", &s, tui.padLabel(&ymax_lbl, max_watts_str, 5), tui.padLabel(&ymin_lbl, "  0W", 5), &anns, chart_h, w);
 }
@@ -406,13 +473,10 @@ pub fn netWidget(buf: []u8, net: *const NetState, w: usize, half_h: usize) !usiz
         }
         const used = 1 + y_w + n_cols + 1;
         if (used < w) {
-            var i: usize = 0;
-            while (i < w - used) : (i += 1) {
-                buf[o] = ' ';
-                o += 1;
-            }
+            @memset(buf[o .. o + (w - used)], ' ');
+            o += w - used;
         }
-        o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ tui.BR, tui.R })).len;
+        o += tui.wrs(buf[o..], CHART_ROW_END);
     }
 
     // Center divider
@@ -426,13 +490,10 @@ pub fn netWidget(buf: []u8, net: *const NetState, w: usize, half_h: usize) !usiz
     o += tui.wrs(buf[o..], tui.R);
     const used_c = 1 + y_w + n_cols + 1;
     if (used_c < w) {
-        var i: usize = 0;
-        while (i < w - used_c) : (i += 1) {
-            buf[o] = ' ';
-            o += 1;
-        }
+        @memset(buf[o .. o + (w - used_c)], ' ');
+        o += w - used_c;
     }
-    o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ tui.BR, tui.R })).len;
+    o += tui.wrs(buf[o..], CHART_ROW_END);
 
     for (0..half_h) |cr| {
         const row_bot = cr * 8;
@@ -461,13 +522,10 @@ pub fn netWidget(buf: []u8, net: *const NetState, w: usize, half_h: usize) !usiz
         }
         const used = 1 + y_w + n_cols + 1;
         if (used < w) {
-            var i: usize = 0;
-            while (i < w - used) : (i += 1) {
-                buf[o] = ' ';
-                o += 1;
-            }
+            @memset(buf[o .. o + (w - used)], ' ');
+            o += w - used;
         }
-        o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ tui.BR, tui.R })).len;
+        o += tui.wrs(buf[o..], CHART_ROW_END);
     }
 
     o += try tui.boxBottom(buf[o..], w);
@@ -491,19 +549,39 @@ fn decimate(out: []f32, n: usize, rb: *const SampleRing) void {
 }
 
 fn rateLabel(buf: []u8, bps: u64) []const u8 {
-    const label = if (bps < 1024) std.fmt.bufPrint(buf, "{d: >4}B", .{bps}) else if (bps < 1024 * 1024) std.fmt.bufPrint(buf, "{d:.1}K", .{@as(f32, @floatFromInt(bps)) / 1024.0}) else std.fmt.bufPrint(buf, "{d:.1}M", .{@as(f32, @floatFromInt(bps)) / (1024.0 * 1024.0)});
-    return label catch {
-        @memcpy(buf[0..5], "   0B");
-        return buf[0..5];
-    };
+    if (bps < 1024) {
+        const n = fmtUintRight(buf, bps, 4);
+        buf[n] = 'B';
+        return buf[0..n + 1];
+    }
+    if (bps < 1024 * 1024) {
+        const val: f32 = @as(f32, @floatFromInt(bps)) / 1024.0;
+        const n = fmtFloatRight(buf, val, 4, 1);
+        buf[n] = 'K';
+        return buf[0..n + 1];
+    }
+    const val: f32 = @as(f32, @floatFromInt(bps)) / (1024.0 * 1024.0);
+    const n = fmtFloatRight(buf, val, 4, 1);
+    buf[n] = 'M';
+    return buf[0..n + 1];
 }
 
 fn fsize(buf: []u8, kb: u64) []const u8 {
     if (kb == 0) return "    0";
     const b = kb * 1024;
-    if (b < 1024 * 1024) return (std.fmt.bufPrint(buf, "{d:.1}KiB", .{@as(f32, @floatFromInt(kb))}) catch return "0")[0..];
-    if (b < 1024 * 1024 * 1024) return (std.fmt.bufPrint(buf, "{d:.1}MiB", .{@as(f32, @floatFromInt(kb)) / 1024.0}) catch return "0")[0..];
-    return (std.fmt.bufPrint(buf, "{d:.1}GiB", .{@as(f32, @floatFromInt(kb)) / (1024.0 * 1024.0)}) catch return "0")[0..];
+    if (b < 1024 * 1024) {
+        const n = fmtFloatRight(buf, @floatFromInt(kb), 4, 1);
+        @memcpy(buf[n..][0..3], "KiB");
+        return buf[0..n + 3];
+    }
+    if (b < 1024 * 1024 * 1024) {
+        const n = fmtFloatRight(buf, @as(f32, @floatFromInt(kb)) / 1024.0, 4, 1);
+        @memcpy(buf[n..][0..3], "MiB");
+        return buf[0..n + 3];
+    }
+    const n = fmtFloatRight(buf, @as(f32, @floatFromInt(kb)) / (1024.0 * 1024.0), 4, 1);
+    @memcpy(buf[n..][0..3], "GiB");
+    return buf[0..n + 3];
 }
 
 // ─── Process widget ───
@@ -521,23 +599,19 @@ pub fn procWidget(buf: []u8, procs: []const *const Process, total_mem_kb: u64, w
     ho += tui.wrs(hr[ho..], "  PID    ");
     ho += writePaddedName(hr[ho..], "NAME", name_w);
     if (show_io) {
-        ho += (try std.fmt.bufPrint(hr[ho..], " CPU%   MEM%   R/s     W/s", .{})).len;
+        ho += tui.wrs(hr[ho..], " CPU%   MEM%   R/s     W/s");
     } else {
-        ho += (try std.fmt.bufPrint(hr[ho..], " CPU%   MEM%", .{})).len;
+        ho += tui.wrs(hr[ho..], " CPU%   MEM%");
     }
-    while (ho < w - 2) {
-        hr[ho] = ' ';
-        ho += 1;
-    }
+    @memset(hr[ho .. w - 2], ' ');
+    ho = w - 2;
     o += try tui.boxRow(buf[o..], hr[0..ho], w);
 
     // Divider row
     var dr: [256]u8 = undefined;
-    var d: usize = 0;
-    while (d < w - 2) : (d += 1) {
-        dr[d] = '-';
-    }
-    o += try tui.boxRow(buf[o..], dr[0..d], w);
+    const divider_len = w -| 2;
+    @memset(dr[0..divider_len], '-');
+    o += try tui.boxRow(buf[o..], dr[0..divider_len], w);
 
     // Process rows
     const count = @min(max_rows, procs.len);
@@ -546,10 +620,9 @@ pub fn procWidget(buf: []u8, procs: []const *const Process, total_mem_kb: u64, w
         const lo = formatProcLine(&lb, proc, total_mem_kb, name_w, show_io);
         // Pad to w-2 visual width
         const lw = tui.visualW(lb[0..lo]);
-        var po = lo;
-        while (po < lo + (w - 2 -| lw)) : (po += 1) {
-            lb[po] = ' ';
-        }
+        const pad_n = w - 2 -| lw;
+        @memset(lb[lo .. lo + pad_n], ' ');
+        const po = lo + pad_n;
         o += try tui.boxRow(buf[o..], lb[0..po], w);
     }
 
@@ -560,23 +633,24 @@ pub fn procWidget(buf: []u8, procs: []const *const Process, total_mem_kb: u64, w
 fn formatProcLine(line: []u8, proc: *const Process, total_mem_kb: u64, name_w: usize, show_io: bool) usize {
     var o: usize = 0;
     const mp: f32 = if (total_mem_kb > 0) @as(f32, @floatFromInt(proc.rss_kb)) / @as(f32, @floatFromInt(total_mem_kb)) * 100.0 else 0;
-    o += (std.fmt.bufPrint(line[o..], "  {d: >6}  ", .{proc.pid}) catch unreachable).len;
+    o += tui.wrs(line[o..], "  ");
+    o += fmtUintRight(line[o..], proc.pid, 6);
+    o += tui.wrs(line[o..], "  ");
     const nm = proc.name[0..@min(proc.name_len, name_w)];
     @memcpy(line[o..][0..nm.len], nm);
     o += nm.len;
-    var p: usize = nm.len;
-    while (p < name_w) : (p += 1) {
-        line[o] = ' ';
-        o += 1;
-    }
+    @memset(line[o .. o + (name_w -| nm.len)], ' ');
+    o += name_w -| nm.len;
     line[o] = ' ';
     o += 1;
-    o += (std.fmt.bufPrint(line[o..], "{d: >5.1}  {d: >5.1}", .{ @min(proc.cpu_pct, 999.9), @min(mp, 999.9) }) catch unreachable).len;
+    o += fmtFloatRight(line[o..], @min(proc.cpu_pct, 999.9), 5, 1);
+    o += tui.wrs(line[o..], "  ");
+    o += fmtFloatRight(line[o..], @min(mp, 999.9), 5, 1);
     if (show_io) {
         o += tui.wrs(line[o..], "   ");
-        o += fmtRate(line[o..], proc.read_rate) catch o;
+        o += fmtRate(line[o..], proc.read_rate);
         o += tui.wrs(line[o..], "   ");
-        o += fmtRate(line[o..], proc.write_rate) catch o;
+        o += fmtRate(line[o..], proc.write_rate);
     }
     return o;
 }
@@ -584,16 +658,24 @@ fn formatProcLine(line: []u8, proc: *const Process, total_mem_kb: u64, name_w: u
 fn writePaddedName(buf: []u8, name: []const u8, width: usize) usize {
     const n = @min(name.len, width);
     @memcpy(buf[0..n], name[0..n]);
-    var o: usize = n;
-    while (o < width) : (o += 1) {
-        buf[o] = ' ';
-    }
-    return o;
+    @memset(buf[n..width], ' ');
+    return width;
 }
 
-fn fmtRate(buf: []u8, bps: u64) !usize {
-    if (bps == 0) return (try std.fmt.bufPrint(buf, "    0 ", .{})).len;
-    if (bps < 1024) return (try std.fmt.bufPrint(buf, "{d: >4}B ", .{bps})).len;
-    if (bps < 1024 * 1024) return (try std.fmt.bufPrint(buf, "{d: >4}K", .{bps / 1024})).len;
-    return (try std.fmt.bufPrint(buf, "{d: >4}M", .{bps / (1024 * 1024)})).len;
+fn fmtRate(buf: []u8, bps: u64) usize {
+    if (bps == 0) return tui.wrs(buf, "    0 ");
+    if (bps < 1024) {
+        const n = fmtUintRight(buf, bps, 4);
+        buf[n] = 'B';
+        buf[n + 1] = ' ';
+        return n + 2;
+    }
+    if (bps < 1024 * 1024) {
+        const n = fmtUintRight(buf, bps / 1024, 4);
+        buf[n] = 'K';
+        return n + 1;
+    }
+    const n = fmtUintRight(buf, bps / (1024 * 1024), 4);
+    buf[n] = 'M';
+    return n + 1;
 }

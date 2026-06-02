@@ -18,6 +18,9 @@ pub const CPU_COLORS = [_][]const u8{ BL, G, RD, Y, M, C, C, BR };
 
 pub const BLOCKS = [_][]const u8{ " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 
+pub const BOX_TOP_SUFFIX = "┐" ++ R ++ "\n";
+pub const BOX_BOTTOM_SUFFIX = "┘" ++ R ++ "\n";
+
 pub const TermSize = struct {
     w: usize,
     h: usize,
@@ -29,27 +32,6 @@ pub fn getTermSize() TermSize {
     if (rc != 0) return .{ .w = 80, .h = 24 };
     return .{ .w = @max(20, @as(usize, ws.col)), .h = @max(10, @as(usize, ws.row)) };
 }
-
-pub const Buffer = struct {
-    data: []u8,
-    pos: usize,
-
-    pub fn init(data: []u8) Buffer {
-        return .{ .data = data, .pos = 0 };
-    }
-
-    pub fn remaining(self: *Buffer) []u8 {
-        return self.data[self.pos..];
-    }
-
-    pub fn advance(self: *Buffer, n: usize) void {
-        self.pos += n;
-    }
-
-    pub fn written(self: *const Buffer) []const u8 {
-        return self.data[0..self.pos];
-    }
-};
 
 pub fn enterRawMode() !std.posix.termios {
     const orig = try std.posix.tcgetattr(STDOUT_FD);
@@ -85,7 +67,7 @@ pub fn boxTop(buf: []u8, title: []const u8, w: usize) !usize {
     o += wrs(buf[o..], " ");
     i = 0;
     while (i < dr) : (i += 1) o += wrs(buf[o..], "─");
-    o += (try std.fmt.bufPrint(buf[o..], "┐{s}\n", .{R})).len;
+    o += wrs(buf[o..], BOX_TOP_SUFFIX);
     return o;
 }
 
@@ -95,7 +77,7 @@ pub fn boxBottom(buf: []u8, w: usize) !usize {
     o += wrs(buf[o..], "└");
     var i: usize = 0;
     while (i < w - 2) : (i += 1) o += wrs(buf[o..], "─");
-    o += (try std.fmt.bufPrint(buf[o..], "┘{s}\n", .{R})).len;
+    o += wrs(buf[o..], BOX_BOTTOM_SUFFIX);
     return o;
 }
 
@@ -107,15 +89,13 @@ pub fn boxRow(buf: []u8, content: []const u8, w: usize) !usize {
     const vw = visualW(content);
     if (vw <= w - 2) {
         o += wrs(buf[o..], content);
-        var i: usize = 0;
-        while (i < w - 2 - vw) : (i += 1) {
-            buf[o] = ' ';
-            o += 1;
-        }
+        const pad_n = w - 2 -| vw;
+        @memset(buf[o .. o + pad_n], ' ');
+        o += pad_n;
     } else {
         o += writeVisualTrunc(buf[o..], content, w - 2);
     }
-    o += (try std.fmt.bufPrint(buf[o..], "{s}│{s}\n", .{ BR, R })).len;
+    o += wrs(buf[o..], BR ++ "│" ++ R ++ "\n");
     return o;
 }
 
@@ -163,15 +143,9 @@ pub fn writeVisualTrunc(buf: []u8, s: []const u8, max_visual: usize) usize {
 
 pub fn padLabel(buf: []u8, s: []const u8, width: usize) []const u8 {
     const pad = width -| s.len;
-    var o: usize = 0;
-    var i: usize = 0;
-    while (i < pad) : (i += 1) {
-        buf[o] = ' ';
-        o += 1;
-    }
-    @memcpy(buf[o..][0..s.len], s);
-    o += s.len;
-    return buf[0..o];
+    @memset(buf[0..pad], ' ');
+    @memcpy(buf[pad..][0..s.len], s);
+    return buf[0..pad + s.len];
 }
 
 // ─── I/O ───
