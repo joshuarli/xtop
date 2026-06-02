@@ -203,7 +203,7 @@ pub fn cpuWidget(buf: []u8, sys: *const SystemCpu, w: usize, ncols: usize, gauge
 fn cpuGauge(buf: []u8, sys: *const SystemCpu, i: usize, gauge_w: usize) !usize {
     const core = sys.cores[i];
     const prev = sys.prev_cores[i];
-    const td = core.total() -| prev.total();
+    const td = if (sys.wall_delta_ms > 0) core.total() -| prev.total() else 0;
     const ad = if (td > 0) core.active() -| prev.active() else 0;
     const pct: f32 = if (td > 0) @as(f32, @floatFromInt(ad)) / @as(f32, @floatFromInt(td)) * 100.0 else 0;
 
