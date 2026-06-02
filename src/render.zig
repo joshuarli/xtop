@@ -89,7 +89,7 @@ pub fn render(
     o += try powerWidget(b[o..], power, w, pwr_chart_h);
     o += try netWidget(b[o..], net, w, net_half_h);
     o += try procWidget(b[o..], procs, mem.total_kb, w, proc_max_rows);
-    o += (try std.fmt.bufPrint(b[o..], "\n  sort: {s} | c/m: sort  q: quit\x1b[K\x1b[J\x1b[?2026l", .{if (sort_key == .cpu) "CPU" else "MEM"})).len;
+    o += (try std.fmt.bufPrint(b[o..], "  sort: {s} | c/m: sort  q: quit\x1b[K\x1b[J\x1b[?2026l", .{if (sort_key == .cpu) "CPU" else "MEM"})).len;
     _ = try tui.writeAll(b[0..o]);
 }
 
