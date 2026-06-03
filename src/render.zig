@@ -603,13 +603,11 @@ pub fn procWidget(buf: []u8, procs: []const *const Process, total_mem_kb: u64, w
     } else {
         ho += tui.wrs(hr[ho..], " CPU%   MEM%");
     }
-    @memset(hr[ho .. w - 2], ' ');
-    ho = w - 2;
     o += try tui.boxRow(buf[o..], hr[0..ho], w);
 
     // Divider row
     var dr: [256]u8 = undefined;
-    const divider_len = w -| 2;
+    const divider_len = @min(w -| 2, dr.len);
     @memset(dr[0..divider_len], '-');
     o += try tui.boxRow(buf[o..], dr[0..divider_len], w);
 
@@ -618,12 +616,7 @@ pub fn procWidget(buf: []u8, procs: []const *const Process, total_mem_kb: u64, w
     var lb: [128]u8 = undefined;
     for (procs[0..count]) |proc| {
         const lo = formatProcLine(&lb, proc, total_mem_kb, name_w, show_io);
-        // Pad to w-2 visual width
-        const lw = tui.visualW(lb[0..lo]);
-        const pad_n = w - 2 -| lw;
-        @memset(lb[lo .. lo + pad_n], ' ');
-        const po = lo + pad_n;
-        o += try tui.boxRow(buf[o..], lb[0..po], w);
+        o += try tui.boxRow(buf[o..], lb[0..lo], w);
     }
 
     o += try tui.boxBottom(buf[o..], w);
