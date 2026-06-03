@@ -37,6 +37,28 @@ fixture.zig   load raw /proc fixture files for tests
 
 System-level reads each tick: `cpu.readCpuStat` → `mem.readMemInfo` → `net.readNetDev` → `power.readPowerInfo` → append % to ring buffers
 
+### Synchronization model
+
+Every rate-based metric requires **two samples separated by a known time interval**. Without a baseline, no rate can be computed — the correct behavior is to display zero (or nothing) until the second sample lands. This means the first post-startup tick always has some metrics at zero.
+
+**The synchronization primitive is `wall_delta_ms`.** `parseCpuStat` sets it to 0 on first parse (when `num_cores == 0`) because `prev_cores` has no real data to delta against. Both `cpuGauge` and `store.updateProcess` guard on `wall_delta_ms > 0` — if zero, all CPU% values stay at zero. On the second tick, `wall_delta_ms` is ~1000 (1s at USER_HZ=100, each jiffy = 10ms), and real per-second utilization is computed.
+
+**Pre-loop baselines.** Before the main loop, net and power each take one sample. This means they have a valid (but tiny) delta on tick 1 — the time window is only the few microseconds between the baseline read and the first tick read. CPU is not given a pre-loop baseline because a single-jiffy window would produce noisy/misleading percentages; it shows zero on tick 1 instead. Mem is absolute (not rate-based), so it's always valid.
+
+**Per-source validity by tick:**
+
+| Source | Tick 1 | Tick 2+ | Guard |
+|--------|--------|---------|-------|
+| CPU gauges | 0% | real | `wall_delta_ms > 0` in render.zig |
+| Per-process CPU% | 0% | real | `wall_delta_ms > 0` in store.zig |
+| Net rates | real (tiny window) | real (~1s window) | `prev_rx_bytes > 0` in net.zig |
+| Power watts | real (tiny window) | real (~1s window) | `prev_energy_uj > 0` in power.zig |
+| Mem absolute | always real | always real | none needed |
+
+**Timing.** The main loop enforces exactly 1s between tick starts: `sleep_ns = 1s - elapsed`. If a tick runs longer than 1s (unlikely for /proc reads), `sleep_ns` underflows to a large i96, the `> 0` check catches it, and the next tick begins immediately — no data is skipped. Each tick reads fresh data directly from /proc before rendering; there is no buffering or caching layer between ticks, so a tick never renders stale data from a prior tick.
+
+**Async process reads.** Per-process /proc reads are dispatched via `Io.async` (thread pool) and all futures are `await`ed before sorting and rendering. A read failure sets `ProcReadResult.valid = false` and the process is silently skipped for that tick. Since all futures complete before rendering, the frame always reflects a consistent snapshot.
+
 **Power tracking** (`power.zig`): reads `/sys/class/powercap/intel-rapl:0/energy_uj` (cumulative microjoules, root-only). Computes watts as `Δenergy / Δtime` across the 1s tick interval. Handles counter wrap via `max_energy_range_uj`. On first call samples a baseline (no power computed). On permission failure sets `has_perms = false` — render shows `"(root required for power stats)"` instead of the chart. The power graph uses the same `renderChart()` as memory, with wattage scaled to max observed.
 
 **Key design decisions:**
