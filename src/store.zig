@@ -20,9 +20,12 @@ pub fn updateProcess(proc_ptr: *Process, result: *const ProcReadResult, wall_del
         const prev_total = proc_ptr.prev_utime + proc_ptr.prev_stime;
         const cur_total = result.utime + result.stime;
         const delta = cur_total -| prev_total;
-        const wall_ticks = wall_delta_ms / 10;
+        // wall_delta_ms is aggregate tick-ms across all cores.
+        // Convert to single-core wall ticks so CPU% is per-core
+        // (a single-threaded process burning one core shows 100%).
+        const wall_ticks = wall_delta_ms / 10 / num_cores;
         if (wall_ticks > 0) {
-            proc_ptr.cpu_pct = @as(f32, @floatFromInt(delta)) / @as(f32, @floatFromInt(wall_ticks)) * 100.0 / @as(f32, @floatFromInt(num_cores));
+            proc_ptr.cpu_pct = @as(f32, @floatFromInt(delta)) / @as(f32, @floatFromInt(wall_ticks)) * 100.0;
         } else {
             proc_ptr.cpu_pct = 0;
         }
@@ -96,7 +99,7 @@ test "updateProcess CPU% delta" {
     r2.utime = 120;
     r2.stime = 80;
     updateProcess(&p, &r2, 1000, 4, 2);
-    try std.testing.expectApproxEqAbs(@as(f32, 12.5), p.cpu_pct, 0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 200.0), p.cpu_pct, 0.1);
 }
 
 test "updateProcess I/O rate" {
